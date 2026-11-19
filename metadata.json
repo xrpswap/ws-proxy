@@ -1,0 +1,6 @@
+{
+  "name": "xrpld-ws-proxy",
+  "description": "High-performance, role-routed XRPL WebSocket reverse proxy with multiplexing, stateful isolation, rate limiting, circuit breaking, and real-time telemetry console.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
