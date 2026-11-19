@@ -91,11 +91,11 @@ export const config = {
     {
       id: 'xrplcluster',
       wsUrl: 'wss://xrplcluster.com/',
-      roles: ['normal', 'path'],
+      roles: ['path'],
       poolSize: 1,
       maxPathConns: 2,
       maxSubscribeConns: 0,
-      rateLimit: { ratePerSec: 3, burst: 10 },
+      rateLimit: { ratePerSec: 3, burst: 15 },
     },
     {
       id: 'xrpl.ws',
@@ -104,16 +104,16 @@ export const config = {
       poolSize: 1,
       maxPathConns: 2,
       maxSubscribeConns: 0,
-      rateLimit: { ratePerSec: 2, burst: 10 },
+      rateLimit: { ratePerSec: 3, burst: 15 },
     },
     {
       id: 'xrpl.link',
       wsUrl: 'wss://xrpl.link/',
-      roles: ['path'],
+      roles: ['normal', 'history'],
       poolSize: 1,
-      maxPathConns: 2,
+      maxPathConns: 0,
       maxSubscribeConns: 0,
-      rateLimit: { ratePerSec: 3, burst: 15 },
+      rateLimit: { ratePerSec: 3, burst: 20 },
     },
     {
       id: 'ripple-s1',
@@ -131,7 +131,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 0,
       maxSubscribeConns: 10,
-      rateLimit: { ratePerSec: 15, burst: 30 },
+      rateLimit: { ratePerSec: 5, burst: 25 },
     },
     {
       id: 'honeycluster',
