@@ -22,6 +22,9 @@ class StatefulChannel {
     this.outboundQueue = [];
     this.ttlTimer = null;
     this.closeResponseTimer = null;
+    this.pingTimer = null;
+    this.pongTimer = null;
+    this.missedPongs = 0;
     this.closingOnResponse = false;
     this.closeRequestInternalId = null;
     this.nextChannelId = 1;
@@ -55,12 +58,22 @@ class StatefulChannel {
     const onOpen = () => {
       if (this.closed || this.ws !== ws) return;
       this.hasOpened = true;
+      this.missedPongs = 0;
       this.node.recordSuccess();
+      this.startPing();
       this.flushOutboundQueue();
+    };
+
+    const onPong = () => {
+      if (this.closed || this.ws !== ws) return;
+      this.missedPongs = 0;
+      this.stopPongTimer();
     };
 
     const onMessage = (rawData) => {
       if (this.closed || this.ws !== ws) return;
+      this.missedPongs = 0;
+      this.stopPongTimer();
       this.handleUpstreamMessage(rawData);
     };
 
@@ -97,6 +110,7 @@ class StatefulChannel {
     };
 
     ws.on('open', onOpen);
+    ws.on('pong', onPong);
     ws.on('message', onMessage);
     ws.on('error', onError);
     ws.on('close', onClose);
@@ -228,7 +242,72 @@ class StatefulChannel {
     this.close();
   }
 
+  stopPongTimer() {
+    if (this.pongTimer) {
+      clearTimeout(this.pongTimer);
+      this.pongTimer = null;
+    }
+  }
+
+  startPing() {
+    this.stopPing();
+    const intervalMs = this.limits.upstreamPingIntervalMs;
+    if (!intervalMs || intervalMs <= 0) return;
+
+    const rawPongTimeout = this.limits.upstreamPongTimeoutMs ?? 10000;
+    const pongTimeoutMs = Math.max(
+      10,
+      Math.min(rawPongTimeout, Math.max(10, intervalMs - 10)),
+    );
+    const maxMissed = Math.max(1, this.limits.upstreamMaxMissedPongs ?? 2);
+
+    this.pingTimer = setInterval(() => {
+      const socket = this.ws;
+      if (this.closed || !socket || socket.readyState !== WebSocket.OPEN) return;
+
+      this.stopPongTimer();
+      try {
+        socket.ping();
+      } catch {
+        return;
+      }
+
+      this.pongTimer = setTimeout(() => {
+        this.pongTimer = null;
+        if (this.closed || this.ws !== socket || socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        this.missedPongs += 1;
+        if (this.missedPongs >= maxMissed) {
+          this.stopPing();
+          try {
+            socket.terminate();
+          } catch {
+            // ignore
+          }
+        }
+      }, pongTimeoutMs);
+
+      if (typeof this.pongTimer.unref === 'function') {
+        this.pongTimer.unref();
+      }
+    }, intervalMs);
+
+    if (typeof this.pingTimer.unref === 'function') {
+      this.pingTimer.unref();
+    }
+  }
+
+  stopPing() {
+    this.stopPongTimer();
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
+
   cleanupTimers() {
+    this.stopPing();
     if (this.ttlTimer) {
       clearTimeout(this.ttlTimer);
       this.ttlTimer = null;

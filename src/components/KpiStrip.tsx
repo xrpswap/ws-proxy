@@ -35,8 +35,9 @@ export function KpiStrip({ stats, loading }: KpiStripProps) {
 
   const maxValidatedSeq = stats?.maxValidatedSeq ?? null;
   const minValidatedSeq = stats?.minValidatedSeq ?? null;
-  const safeValidatedSeq = stats?.safeValidatedSeq ?? null;
+  const safeValidatedSeq = stats?.safeBroadcastSeq ?? stats?.safeValidatedSeq ?? null;
   const sampledLedgerNodes = stats?.sampledLedgerNodes ?? 0;
+  const sharedLedgerSubscribers = stats?.sharedLedgerSubscribers ?? 0;
   const maxLagSpread =
     maxValidatedSeq !== null && minValidatedSeq !== null
       ? Math.max(0, maxValidatedSeq - minValidatedSeq)
@@ -66,7 +67,9 @@ export function KpiStrip({ stats, loading }: KpiStripProps) {
         </div>
         <div className="mt-1.5 text-xs text-slate-500 font-mono tabular-nums truncate">
           {maxValidatedSeq !== null
-            ? `Safe #${safeValidatedSeq ?? maxValidatedSeq} · Δ${maxLagSpread ?? 0} · ${sampledLedgerNodes}/${totalNodes}`
+            ? sharedLedgerSubscribers > 0
+              ? `Safe #${safeValidatedSeq ?? maxValidatedSeq} · ${sharedLedgerSubscribers} shared subs`
+              : `Safe #${safeValidatedSeq ?? maxValidatedSeq} · Δ${maxLagSpread ?? 0} · ${sampledLedgerNodes}/${totalNodes}`
             : `0/${totalNodes} nodes sampled`}
         </div>
       </div>

@@ -8,12 +8,14 @@ export class MockXrpldNode {
     ledgerIndex = 92450100,
     clioMode = false,
     strictLedgerCheck = false,
+    rejectSubscribe = false,
   } = {}) {
     this.id = id;
     this.roles = roles;
     this.ledgerIndex = ledgerIndex;
     this.clioMode = clioMode;
     this.strictLedgerCheck = strictLedgerCheck;
+    this.rejectSubscribe = rejectSubscribe;
     this.server = null;
     this.wss = null;
     this.port = 0;
@@ -22,6 +24,7 @@ export class MockXrpldNode {
     this.receivedCommands = [];
     this.activeConnections = new Set();
     this.streamTimers = new Map();
+    this.ledgerSubscribers = new Set();
   }
 
   get wsUrl() {
@@ -55,6 +58,7 @@ export class MockXrpldNode {
 
       const onClose = () => {
         this.activeConnections.delete(ws);
+        this.ledgerSubscribers.delete(ws);
         const timer = this.streamTimers.get(ws);
         if (timer) {
           clearInterval(timer);
@@ -91,6 +95,32 @@ export class MockXrpldNode {
 
   armLoadWarning() {
     this.loadWarningArmed = true;
+  }
+
+  buildLedgerEvent(seq = this.ledgerIndex) {
+    return {
+      type: 'ledgerClosed',
+      ledger_index: seq,
+      ledger_hash: `4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB8${String(seq).padStart(8, '0')}`,
+      ledger_time: Math.floor(Date.now() / 1000),
+      fee_base: 10,
+      fee_ref: 10,
+      reserve_base: 10000000,
+      reserve_inc: 2000000,
+      txn_count: 12,
+      validated_ledgers: `32570-${seq}`,
+      _mockNode: this.id,
+    };
+  }
+
+  emitLedgerClosed(newSeq = this.ledgerIndex + 1) {
+    this.ledgerIndex = newSeq;
+    const evt = JSON.stringify(this.buildLedgerEvent(newSeq));
+    for (const ws of this.ledgerSubscribers) {
+      if (ws.readyState === 1) {
+        ws.send(evt);
+      }
+    }
   }
 
   handleRequest(ws, req) {
@@ -272,30 +302,47 @@ export class MockXrpldNode {
           }
         }
         break;
-      case 'subscribe':
+      case 'subscribe': {
+        if (this.rejectSubscribe) {
+          const errResp = {
+            status: 'error',
+            type: 'response',
+            error: 'tooBusy',
+            error_message: 'Mock subscribe rejected',
+            _mockNode: this.id,
+          };
+          if (req.id !== undefined && req.id !== null) errResp.id = req.id;
+          if (ws.readyState === 1) ws.send(JSON.stringify(errResp));
+          return;
+        }
+        const evt = this.buildLedgerEvent(this.ledgerIndex);
         response.result = {
-          ledger_index: this.ledgerIndex,
-          validated_ledgers: `32570-${this.ledgerIndex}`,
+          ledger_index: evt.ledger_index,
+          ledger_hash: evt.ledger_hash,
+          ledger_time: evt.ledger_time,
+          fee_base: evt.fee_base,
+          fee_ref: evt.fee_ref,
+          reserve_base: evt.reserve_base,
+          reserve_inc: evt.reserve_inc,
+          validated_ledgers: evt.validated_ledgers,
         };
+        if (Array.isArray(req?.streams) && req.streams.includes('ledger')) {
+          this.ledgerSubscribers.add(ws);
+        }
         if (!this.streamTimers.has(ws)) {
           const timer = setInterval(() => {
             if (ws.readyState === 1) {
               this.ledgerIndex += 1;
-              ws.send(
-                JSON.stringify({
-                  type: 'ledgerClosed',
-                  ledger_index: this.ledgerIndex,
-                  ledger_time: Math.floor(Date.now() / 1000),
-                  _mockNode: this.id,
-                }),
-              );
+              ws.send(JSON.stringify(this.buildLedgerEvent(this.ledgerIndex)));
             }
           }, 4000);
           if (typeof timer.unref === 'function') timer.unref();
           this.streamTimers.set(ws, timer);
         }
         break;
+      }
       case 'unsubscribe': {
+        this.ledgerSubscribers.delete(ws);
         const timer = this.streamTimers.get(ws);
         if (timer) {
           clearInterval(timer);
@@ -317,6 +364,7 @@ export class MockXrpldNode {
 
   async stop() {
     this.online = false;
+    this.ledgerSubscribers.clear();
     for (const timer of this.streamTimers.values()) {
       clearInterval(timer);
     }

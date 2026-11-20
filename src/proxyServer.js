@@ -7,6 +7,35 @@ import { NodeManager } from './nodeManager.js';
 import { classifyRequest } from './router.js';
 import { ClientStatefulManager } from './stateful.js';
 
+function isPureLedgerCommand(payload, expectedCommand) {
+  if (!payload || typeof payload !== 'object' || payload.command !== expectedCommand) {
+    return false;
+  }
+  if (
+    !Array.isArray(payload.streams) ||
+    payload.streams.length !== 1 ||
+    payload.streams[0] !== 'ledger'
+  ) {
+    return false;
+  }
+  const extraKeys = [
+    'accounts',
+    'accounts_proposed',
+    'books',
+    'url',
+    'url_username',
+    'url_password',
+  ];
+  for (const key of extraKeys) {
+    if (payload[key] !== undefined && payload[key] !== null) {
+      if (!Array.isArray(payload[key]) || payload[key].length > 0) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 export class ProxyServer {
   constructor(customConfig = {}) {
     this.config = customConfig.nodes && customConfig.server && customConfig.limits
@@ -14,6 +43,9 @@ export class ProxyServer {
       : createConfig(customConfig);
 
     this.nodeManager = new NodeManager(this.config);
+    this.nodeManager.onSafeLedgerAdvanced = (snapshot) => {
+      this.broadcastSharedLedgerClosed(snapshot);
+    };
     this.cache = new ReadCache(this.config.cache);
 
     this.wss = new WebSocketServer({
@@ -144,6 +176,7 @@ export class ProxyServer {
       ws,
       ip: clientIp,
       isAlive: true,
+      sharedLedgerSubscribed: false,
       stateful: new ClientStatefulManager(ws, this.nodeManager, this.config.limits),
       cleaned: false,
       handlers: null,
@@ -178,6 +211,7 @@ export class ProxyServer {
   cleanupSession(session) {
     if (!session || session.cleaned) return;
     session.cleaned = true;
+    session.sharedLedgerSubscribed = false;
 
     const { ws, ip, handlers, stateful } = session;
     this.sessions.delete(ws);
@@ -236,6 +270,37 @@ export class ProxyServer {
     }
 
     const routeInfo = classifyRequest(payload, this.config.routing, this.config.cache);
+
+    if (this.config.ledgerStream?.shareWithClients) {
+      if (isPureLedgerCommand(payload, 'subscribe')) {
+        const snapshot = await this.nodeManager.getInitialLedgerSnapshot();
+        if (session.cleaned || this.isShuttingDown) return;
+        if (snapshot) {
+          session.sharedLedgerSubscribed = true;
+          const resp = {
+            status: 'success',
+            type: 'response',
+            result: { ...snapshot },
+          };
+          if (hasOriginalId) resp.id = originalId;
+          sendWsJson(session.ws, resp);
+          return;
+        }
+      } else if (isPureLedgerCommand(payload, 'unsubscribe')) {
+        const wasShared = session.sharedLedgerSubscribed;
+        session.sharedLedgerSubscribed = false;
+        if (wasShared || !session.stateful.subscribeChannel) {
+          const resp = {
+            status: 'success',
+            type: 'response',
+            result: {},
+          };
+          if (hasOriginalId) resp.id = originalId;
+          sendWsJson(session.ws, resp);
+          return;
+        }
+      }
+    }
 
     if (routeInfo.isStateful) {
       await session.stateful.handleMessage(payload, routeInfo);
@@ -312,13 +377,54 @@ export class ProxyServer {
     }
   }
 
+  broadcastSharedLedgerClosed(snapshot) {
+    if (this.isShuttingDown || !snapshot || !this.config.ledgerStream?.shareWithClients) {
+      return;
+    }
+    const maxBuffer = this.config.ledgerStream?.maxClientBufferBytes ?? 256 * 1024;
+    const eventPayload = {
+      type: 'ledgerClosed',
+      ledger_index: snapshot.ledger_index,
+      ...(snapshot.ledger_hash ? { ledger_hash: snapshot.ledger_hash } : {}),
+      ...(snapshot.ledger_time !== undefined ? { ledger_time: snapshot.ledger_time } : {}),
+      ...(snapshot.fee_base !== undefined ? { fee_base: snapshot.fee_base } : {}),
+      ...(snapshot.fee_ref !== undefined ? { fee_ref: snapshot.fee_ref } : {}),
+      ...(snapshot.reserve_base !== undefined ? { reserve_base: snapshot.reserve_base } : {}),
+      ...(snapshot.reserve_inc !== undefined ? { reserve_inc: snapshot.reserve_inc } : {}),
+      ...(snapshot.txn_count !== undefined ? { txn_count: snapshot.txn_count } : {}),
+      ...(snapshot.validated_ledgers ? { validated_ledgers: snapshot.validated_ledgers } : {}),
+    };
+    const serialized = JSON.stringify(eventPayload);
+
+    for (const session of this.sessions.values()) {
+      if (session.cleaned || !session.sharedLedgerSubscribed) continue;
+      const ws = session.ws;
+      if (ws.readyState !== ws.OPEN) continue;
+      if (maxBuffer > 0 && ws.bufferedAmount >= maxBuffer) {
+        continue;
+      }
+      try {
+        ws.send(serialized);
+      } catch {
+        // ignore send errors on closing socket
+      }
+    }
+  }
+
   getStats() {
     const nodeStats = this.nodeManager.getStats();
     const cacheStats = this.cache.getStats();
+    let sharedLedgerSubscribers = 0;
+    for (const session of this.sessions.values()) {
+      if (!session.cleaned && session.sharedLedgerSubscribed) {
+        sharedLedgerSubscribers += 1;
+      }
+    }
 
     return {
       clientConnections: this.sessions.size,
       uniqueIps: this.ipConnectionCounts.size,
+      sharedLedgerSubscribers,
       totalNodes: nodeStats.totalNodes,
       healthyNodes: nodeStats.healthyNodes,
       totalQps: nodeStats.totalQps,
@@ -328,8 +434,11 @@ export class ProxyServer {
       maxValidatedSeq: nodeStats.maxValidatedSeq,
       minValidatedSeq: nodeStats.minValidatedSeq,
       safeValidatedSeq: nodeStats.safeValidatedSeq,
+      safeBroadcastSeq: nodeStats.safeBroadcastSeq,
       sampledLedgerNodes: nodeStats.sampledLedgerNodes,
+      snapshotCacheSize: nodeStats.snapshotCacheSize,
       cache: cacheStats,
+      ledgerStream: this.config.ledgerStream,
       nodes: nodeStats.nodes,
       routing: {
         pathCommands: this.config.routing.pathCommands,

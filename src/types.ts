@@ -34,6 +34,7 @@ export interface NodeStats {
 export interface ProxyStats {
   clientConnections: number;
   uniqueIps: number;
+  sharedLedgerSubscribers?: number;
   totalNodes: number;
   healthyNodes: number;
   totalQps: number;
@@ -43,7 +44,9 @@ export interface ProxyStats {
   maxValidatedSeq?: number | null;
   minValidatedSeq?: number | null;
   safeValidatedSeq?: number | null;
+  safeBroadcastSeq?: number | null;
   sampledLedgerNodes?: number;
+  snapshotCacheSize?: number;
   mockMode?: boolean;
   cache: {
     enabled: boolean;
@@ -54,6 +57,14 @@ export interface ProxyStats {
     coalesced: number;
     size: number;
     inflight: number;
+  };
+  ledgerStream?: {
+    enabled: boolean;
+    shareWithClients: boolean;
+    staleMs: number;
+    startupSettleMs?: number;
+    maxSnapshots: number;
+    maxClientBufferBytes: number;
   };
   nodes: NodeStats[];
   routing: {
@@ -75,6 +86,8 @@ export interface ProxyStats {
     circuitBreakerThreshold: number;
     slowDownRecoveryMs: number;
     upstreamPingIntervalMs: number;
+    upstreamPongTimeoutMs?: number;
+    upstreamMaxMissedPongs?: number;
     reconnectBaseDelayMs: number;
     reconnectMaxDelayMs: number;
     clioCooldownMs?: number;

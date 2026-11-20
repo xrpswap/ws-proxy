@@ -63,6 +63,8 @@ export const config = {
     circuitBreakerThreshold: 3,
     slowDownRecoveryMs: 15000,
     upstreamPingIntervalMs: 25000,
+    upstreamPongTimeoutMs: 10000,
+    upstreamMaxMissedPongs: 2,
     reconnectBaseDelayMs: 500,
     reconnectMaxDelayMs: 15000,
     clioCooldownMs: 120000,
@@ -90,6 +92,14 @@ export const config = {
     enabled: true,
     ttlMs: 1500,
     commands: ['fee', 'server_info', 'ledger_closed'],
+  },
+  ledgerStream: {
+    enabled: true,
+    shareWithClients: true,
+    staleMs: 20000,
+    startupSettleMs: 400,
+    maxSnapshots: 30,
+    maxClientBufferBytes: 256 * 1024,
   },
   nodes: [
     {
@@ -126,7 +136,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 0,
       maxSubscribeConns: 0,
-      rateLimit: { ratePerSec: 10, burst: 20 },
+      rateLimit: { ratePerSec: 5, burst: 20 },
     },
     {
       id: 'ripple-s2',
@@ -135,7 +145,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 0,
       maxSubscribeConns: 5,
-      rateLimit: { ratePerSec: 10, burst: 25 },
+      rateLimit: { ratePerSec: 5, burst: 25 },
     },
     {
       id: 'honeycluster',
@@ -144,7 +154,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 0,
       maxSubscribeConns: 5,
-      rateLimit: { ratePerSec: 10, burst: 20 },
+      rateLimit: { ratePerSec: 5, burst: 20 },
     },
   ],
 };
@@ -200,6 +210,10 @@ export function createConfig(overrides = {}) {
       commands: overrides.cache?.commands
         ? [...overrides.cache.commands]
         : [...config.cache.commands],
+    },
+    ledgerStream: {
+      ...config.ledgerStream,
+      ...(overrides.ledgerStream || {}),
     },
     nodes: Array.isArray(overrides.nodes)
       ? overrides.nodes.map(cloneNode)

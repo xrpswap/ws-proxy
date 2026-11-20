@@ -34,10 +34,13 @@ class UpstreamPoolConnection {
     this.ws = null;
     this.outboundQueue = [];
     this.pingTimer = null;
+    this.pongTimer = null;
+    this.missedPongs = 0;
     this.reconnectTimer = null;
     this.reconnectAttempts = 0;
     this.destroyed = false;
     this.hasConnectedOnce = false;
+    this.ledgerSubscribed = false;
   }
 
   get isOpen() {
@@ -70,14 +73,27 @@ class UpstreamPoolConnection {
     const onOpen = () => {
       if (this.destroyed || this.ws !== ws) return;
       this.reconnectAttempts = 0;
+      this.missedPongs = 0;
       this.hasConnectedOnce = true;
+      this.ledgerSubscribed = false;
       this.node.onPoolConnected();
       this.startPing();
       this.flushOutboundQueue();
+      if (this.index === 0 && this.manager.isLedgerStreamEnabled()) {
+        this.manager.subscribePoolLedger(this.node, this);
+      }
+    };
+
+    const onPong = () => {
+      if (this.destroyed || this.ws !== ws) return;
+      this.missedPongs = 0;
+      this.stopPongTimer();
     };
 
     const onMessage = (rawData) => {
       if (this.destroyed || this.ws !== ws) return;
+      this.missedPongs = 0;
+      this.stopPongTimer();
       this.manager.handlePoolMessage(this.node, this, rawData);
     };
 
@@ -87,6 +103,8 @@ class UpstreamPoolConnection {
 
     const onClose = () => {
       this.stopPing();
+      this.missedPongs = 0;
+      this.ledgerSubscribed = false;
       ws.removeAllListeners();
       if (this.ws === ws) {
         this.ws = null;
@@ -106,9 +124,17 @@ class UpstreamPoolConnection {
     };
 
     ws.on('open', onOpen);
+    ws.on('pong', onPong);
     ws.on('message', onMessage);
     ws.on('error', onError);
     ws.on('close', onClose);
+  }
+
+  stopPongTimer() {
+    if (this.pongTimer) {
+      clearTimeout(this.pongTimer);
+      this.pongTimer = null;
+    }
   }
 
   startPing() {
@@ -116,13 +142,45 @@ class UpstreamPoolConnection {
     const intervalMs = this.manager.limits.upstreamPingIntervalMs;
     if (!intervalMs || intervalMs <= 0) return;
 
+    const rawPongTimeout = this.manager.limits.upstreamPongTimeoutMs ?? 10000;
+    const pongTimeoutMs = Math.max(
+      10,
+      Math.min(rawPongTimeout, Math.max(10, intervalMs - 10)),
+    );
+    const maxMissed = Math.max(1, this.manager.limits.upstreamMaxMissedPongs ?? 2);
+
     this.pingTimer = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        try {
-          this.ws.ping();
-        } catch {
-          // ignore
+      const socket = this.ws;
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+      this.stopPongTimer();
+      try {
+        socket.ping();
+      } catch {
+        return;
+      }
+
+      this.pongTimer = setTimeout(() => {
+        this.pongTimer = null;
+        if (this.destroyed || this.ws !== socket || socket.readyState !== WebSocket.OPEN) {
+          return;
         }
+        this.missedPongs += 1;
+        if (this.missedPongs >= maxMissed) {
+          console.warn(
+            `[proxy] Upstream node "${this.node.id}" missed ${this.missedPongs} pongs, terminating dead connection`,
+          );
+          this.stopPing();
+          try {
+            socket.terminate();
+          } catch {
+            // ignore
+          }
+        }
+      }, pongTimeoutMs);
+
+      if (typeof this.pongTimer.unref === 'function') {
+        this.pongTimer.unref();
       }
     }, intervalMs);
 
@@ -132,6 +190,7 @@ class UpstreamPoolConnection {
   }
 
   stopPing() {
+    this.stopPongTimer();
     if (this.pingTimer) {
       clearInterval(this.pingTimer);
       this.pingTimer = null;
@@ -278,11 +337,13 @@ export class NodeRuntime {
     this.lastValidatedAt = null;
     this.clioVersion = null;
     this.currentRejectedUntil = 0;
+    this.ledgerStreamSupported = true;
   }
 
   onPoolConnected() {
     this.currentRejectedUntil = 0;
     this.clioVersion = null;
+    this.ledgerStreamSupported = true;
   }
 
   isCurrentRejected(now = Date.now()) {
@@ -291,6 +352,38 @@ export class NodeRuntime {
 
   markCurrentRejected(cooldownMs = this.limits.clioCooldownMs ?? 120000) {
     this.currentRejectedUntil = Date.now() + cooldownMs;
+  }
+
+  extractLedgerSnapshot(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    const rawSeq = obj.ledger_index;
+    if (typeof rawSeq !== 'number' || !Number.isFinite(rawSeq) || rawSeq <= 0) {
+      return null;
+    }
+    const seq = Math.trunc(rawSeq);
+    const snapshot = { ledger_index: seq };
+    if (typeof obj.ledger_hash === 'string') snapshot.ledger_hash = obj.ledger_hash;
+    if (typeof obj.ledger_time === 'number') snapshot.ledger_time = obj.ledger_time;
+    if (typeof obj.fee_base === 'number') snapshot.fee_base = obj.fee_base;
+    if (typeof obj.fee_ref === 'number') snapshot.fee_ref = obj.fee_ref;
+    if (typeof obj.reserve_base === 'number') snapshot.reserve_base = obj.reserve_base;
+    if (typeof obj.reserve_inc === 'number') snapshot.reserve_inc = obj.reserve_inc;
+    if (typeof obj.txn_count === 'number') snapshot.txn_count = obj.txn_count;
+    if (typeof obj.validated_ledgers === 'string') {
+      snapshot.validated_ledgers = obj.validated_ledgers;
+    }
+    return snapshot;
+  }
+
+  updateLedgerTelemetryFromEvent(msg) {
+    const snapshot = this.extractLedgerSnapshot(msg);
+    if (!snapshot) return null;
+    this.lastValidatedSeq =
+      this.lastValidatedSeq === null
+        ? snapshot.ledger_index
+        : Math.max(this.lastValidatedSeq, snapshot.ledger_index);
+    this.lastValidatedAt = Date.now();
+    return snapshot;
   }
 
   updateLedgerTelemetry(msg) {
@@ -312,6 +405,7 @@ export class NodeRuntime {
       typeof result.ledger_index === 'number' &&
       Number.isFinite(result.ledger_index) &&
       (result.validated === true ||
+        typeof result.validated_ledgers === 'string' ||
         (typeof result.ledger_hash === 'string' &&
           result.ledger_current_index === undefined))
     ) {
@@ -582,11 +676,51 @@ export class NodeManager {
       maxWaitMs: this.limits.queueMaxWaitMs,
     });
     this.started = false;
+    this.ledgerSnapshots = new Map();
+    this.highestSnapshotSeq = 0;
+    this.lastBroadcastSeq = 0;
+    this.onSafeLedgerAdvanced = null;
+    this.pendingLedgerSubWaiters = [];
+    this.streamSettleDeadline = 0;
+    this.streamSettleTimer = null;
+  }
+
+  isLedgerStreamEnabled() {
+    return Boolean(this.config.ledgerStream?.enabled);
+  }
+
+  hasPendingInitialLedgerNodes(now = Date.now()) {
+    if (!this.isLedgerStreamEnabled() || now >= this.streamSettleDeadline) {
+      return false;
+    }
+    return this.nodes.some(
+      (n) =>
+        n.ledgerStreamSupported &&
+        n.circuitState !== 'OPEN' &&
+        n.lastValidatedSeq === null &&
+        n.pool[0] &&
+        !n.pool[0].destroyed,
+    );
   }
 
   start() {
     if (this.started) return;
     this.started = true;
+    if (this.isLedgerStreamEnabled()) {
+      const settleMs = this.config.ledgerStream?.startupSettleMs ?? 400;
+      this.streamSettleDeadline = Date.now() + settleMs;
+      if (this.streamSettleTimer) {
+        clearTimeout(this.streamSettleTimer);
+      }
+      this.streamSettleTimer = setTimeout(() => {
+        this.streamSettleTimer = null;
+        this.flushPendingLedgerWaiters();
+        this.evaluateSafeBroadcast();
+      }, settleMs + 10);
+      if (typeof this.streamSettleTimer.unref === 'function') {
+        this.streamSettleTimer.unref();
+      }
+    }
     for (const node of this.nodes) {
       node.startPool();
     }
@@ -637,11 +771,18 @@ export class NodeManager {
     }
 
     if (requestedLedgerIndex !== null && requestedLedgerIndex !== undefined) {
-      const synced = candidates.filter(
-        (n) => n.lastValidatedSeq === null || n.lastValidatedSeq >= requestedLedgerIndex,
+      const knownSynced = candidates.filter(
+        (n) => n.lastValidatedSeq !== null && n.lastValidatedSeq >= requestedLedgerIndex,
       );
-      if (synced.length > 0) {
-        candidates = synced;
+      if (knownSynced.length > 0) {
+        candidates = knownSynced;
+      } else {
+        const unsampledOrSynced = candidates.filter(
+          (n) => n.lastValidatedSeq === null || n.lastValidatedSeq >= requestedLedgerIndex,
+        );
+        if (unsampledOrSynced.length > 0) {
+          candidates = unsampledOrSynced;
+        }
       }
     }
 
@@ -831,7 +972,230 @@ export class NodeManager {
     return lastResponse;
   }
 
-  handlePoolMessage(node, _conn, rawData) {
+  subscribePoolLedger(node, conn) {
+    if (!this.isLedgerStreamEnabled() || !conn || !conn.isOpen || conn.ledgerSubscribed) {
+      return;
+    }
+    const proxyId = this.nextProxyId++;
+    const timeoutMs = Math.min(this.limits.requestTimeoutMs ?? 5000, 5000);
+    const timer = setTimeout(() => {
+      const entry = this.pendingRequests.get(proxyId);
+      if (!entry) return;
+      this.pendingRequests.delete(proxyId);
+      // Do not trip circuit breaker on internal ledger subscribe timeout
+      node.ledgerStreamSupported = false;
+    }, timeoutMs);
+
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
+
+    this.pendingRequests.set(proxyId, {
+      originalId: proxyId,
+      hasOriginalId: true,
+      isInternalLedgerSub: true,
+      timer,
+      nodeId: node.id,
+      node,
+      conn,
+      resolve: () => {},
+      reject: () => {},
+    });
+
+    const sent = conn.sendRaw(
+      JSON.stringify({
+        id: proxyId,
+        command: 'subscribe',
+        streams: ['ledger'],
+      }),
+    );
+    if (!sent) {
+      clearTimeout(timer);
+      this.pendingRequests.delete(proxyId);
+    }
+  }
+
+  recordLedgerSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot.ledger_index !== 'number' || snapshot.ledger_index <= 0) {
+      return;
+    }
+    const seq = snapshot.ledger_index;
+    const prev = this.ledgerSnapshots.get(seq);
+    const latestSnap =
+      this.highestSnapshotSeq > 0 ? this.ledgerSnapshots.get(this.highestSnapshotSeq) : null;
+    const merged = {
+      ...(latestSnap
+        ? {
+            fee_base: latestSnap.fee_base,
+            fee_ref: latestSnap.fee_ref,
+            reserve_base: latestSnap.reserve_base,
+            reserve_inc: latestSnap.reserve_inc,
+            validated_ledgers: latestSnap.validated_ledgers,
+          }
+        : {}),
+      ...(prev || {}),
+      ...snapshot,
+      ledger_index: seq,
+    };
+    this.ledgerSnapshots.set(seq, merged);
+    if (seq > this.highestSnapshotSeq) {
+      this.highestSnapshotSeq = seq;
+    }
+
+    const maxSnapshots = Math.max(5, this.config.ledgerStream?.maxSnapshots ?? 30);
+    if (this.ledgerSnapshots.size > maxSnapshots) {
+      const cutoff = this.highestSnapshotSeq - maxSnapshots;
+      for (const key of this.ledgerSnapshots.keys()) {
+        if (key <= cutoff || this.ledgerSnapshots.size > maxSnapshots) {
+          this.ledgerSnapshots.delete(key);
+          if (this.ledgerSnapshots.size <= maxSnapshots && key > cutoff) {
+            break;
+          }
+        }
+      }
+    }
+
+    if (this.pendingLedgerSubWaiters.length > 0 && !this.hasPendingInitialLedgerNodes()) {
+      this.flushPendingLedgerWaiters();
+    }
+  }
+
+  flushPendingLedgerWaiters() {
+    if (this.pendingLedgerSubWaiters.length === 0) return;
+    const snap = this.getBestSafeSnapshot();
+    if (!snap && this.hasPendingInitialLedgerNodes()) return;
+    const waiters = this.pendingLedgerSubWaiters.splice(0, this.pendingLedgerSubWaiters.length);
+    for (const w of waiters) {
+      clearTimeout(w.timer);
+      w.resolve(snap);
+    }
+  }
+
+  computeLedgerWatermarks(now = Date.now()) {
+    const staleMs = this.config.ledgerStream?.staleMs ?? 20000;
+    const maxSafeLag = this.limits.maxSafeLedgerLag ?? 15;
+
+    const sampledAll = this.nodes.filter((n) => typeof n.lastValidatedSeq === 'number');
+    const sampledHealthyOnline = sampledAll.filter(
+      (n) => n.isOnline && n.circuitState === 'CLOSED',
+    );
+    const freshHealthy = sampledHealthyOnline.filter(
+      (n) => typeof n.lastValidatedAt === 'number' && now - n.lastValidatedAt <= staleMs,
+    );
+
+    const activePool =
+      freshHealthy.length > 0
+        ? freshHealthy
+        : sampledHealthyOnline.length > 0
+          ? sampledHealthyOnline
+          : sampledAll;
+
+    let maxValidatedSeq = null;
+    let minValidatedSeq = null;
+    let safeValidatedSeq = null;
+
+    if (activePool.length > 0) {
+      for (const n of activePool) {
+        const seq = n.lastValidatedSeq;
+        if (maxValidatedSeq === null || seq > maxValidatedSeq) {
+          maxValidatedSeq = seq;
+        }
+        if (minValidatedSeq === null || seq < minValidatedSeq) {
+          minValidatedSeq = seq;
+        }
+      }
+      for (const n of activePool) {
+        const seq = n.lastValidatedSeq;
+        if (maxValidatedSeq - seq <= maxSafeLag) {
+          if (safeValidatedSeq === null || seq < safeValidatedSeq) {
+            safeValidatedSeq = seq;
+          }
+        }
+      }
+    }
+
+    return {
+      maxValidatedSeq,
+      minValidatedSeq,
+      safeValidatedSeq,
+      sampledLedgerNodes: sampledAll.length,
+    };
+  }
+
+  getBestSafeSnapshot() {
+    const { safeValidatedSeq } = this.computeLedgerWatermarks();
+    const targetSeq = safeValidatedSeq ?? this.highestSnapshotSeq;
+    if (targetSeq && this.ledgerSnapshots.has(targetSeq)) {
+      return this.ledgerSnapshots.get(targetSeq);
+    }
+    let best = null;
+    for (const [seq, snap] of this.ledgerSnapshots.entries()) {
+      if (targetSeq && seq > targetSeq) continue;
+      if (!best || seq > best.ledger_index) {
+        best = snap;
+      }
+    }
+    if (!best && this.highestSnapshotSeq > 0) {
+      best = this.ledgerSnapshots.get(this.highestSnapshotSeq) || null;
+    }
+    return best;
+  }
+
+  async getInitialLedgerSnapshot(timeoutMs = 1500) {
+    if (!this.hasPendingInitialLedgerNodes()) {
+      const existing = this.getBestSafeSnapshot();
+      if (existing) return existing;
+    }
+    if (!this.isLedgerStreamEnabled()) return null;
+
+    return new Promise((resolve) => {
+      const waiter = {
+        timer: null,
+        resolve,
+      };
+      waiter.timer = setTimeout(() => {
+        const idx = this.pendingLedgerSubWaiters.indexOf(waiter);
+        if (idx !== -1) {
+          this.pendingLedgerSubWaiters.splice(idx, 1);
+        }
+        resolve(this.getBestSafeSnapshot());
+      }, timeoutMs);
+      if (typeof waiter.timer.unref === 'function') {
+        waiter.timer.unref();
+      }
+      this.pendingLedgerSubWaiters.push(waiter);
+    });
+  }
+
+  evaluateSafeBroadcast() {
+    if (this.hasPendingInitialLedgerNodes()) {
+      return;
+    }
+    const { safeValidatedSeq } = this.computeLedgerWatermarks();
+    if (safeValidatedSeq === null || safeValidatedSeq <= this.lastBroadcastSeq) {
+      return;
+    }
+
+    let snap = this.ledgerSnapshots.get(safeValidatedSeq) || null;
+    if (!snap) {
+      for (const [seq, candidate] of this.ledgerSnapshots.entries()) {
+        if (seq <= safeValidatedSeq && seq > this.lastBroadcastSeq) {
+          if (!snap || seq > snap.ledger_index) {
+            snap = candidate;
+          }
+        }
+      }
+    }
+
+    if (snap && snap.ledger_index > this.lastBroadcastSeq) {
+      this.lastBroadcastSeq = snap.ledger_index;
+      if (typeof this.onSafeLedgerAdvanced === 'function') {
+        this.onSafeLedgerAdvanced(snap);
+      }
+    }
+  }
+
+  handlePoolMessage(node, conn, rawData) {
     let msg;
     try {
       const text = typeof rawData === 'string' ? rawData : rawData.toString('utf8');
@@ -841,6 +1205,16 @@ export class NodeManager {
     }
 
     if (!msg || typeof msg !== 'object') return;
+
+    if (msg.type === 'ledgerClosed') {
+      const snapshot = node.updateLedgerTelemetryFromEvent(msg);
+      if (snapshot) {
+        this.recordLedgerSnapshot(snapshot);
+        this.evaluateSafeBroadcast();
+      }
+      return;
+    }
+
     const proxyId = msg.id;
     if (proxyId === undefined || proxyId === null) return;
 
@@ -849,6 +1223,30 @@ export class NodeManager {
 
     clearTimeout(entry.timer);
     this.pendingRequests.delete(proxyId);
+
+    if (entry.isInternalLedgerSub) {
+      if (msg.status === 'error') {
+        // Internal background subscribe unsupported or busy: never trip circuit breaker
+        node.ledgerStreamSupported = false;
+        if (!this.hasPendingInitialLedgerNodes()) {
+          this.flushPendingLedgerWaiters();
+          this.evaluateSafeBroadcast();
+        }
+        return;
+      }
+      if (conn) {
+        conn.ledgerSubscribed = true;
+      }
+      node.ledgerStreamSupported = true;
+      node.updateLedgerTelemetry(msg);
+      const snapshot = node.extractLedgerSnapshot(msg.result);
+      if (snapshot) {
+        this.recordLedgerSnapshot(snapshot);
+        this.evaluateSafeBroadcast();
+      }
+      node.recordSuccess();
+      return;
+    }
 
     if (node.circuitState === 'HALF_OPEN') {
       node.halfOpenInFlight = false;
@@ -1040,35 +1438,12 @@ export class NodeManager {
     const totalQps = Number(
       nodes.reduce((sum, n) => sum + n.qps, 0).toFixed(2),
     );
-
-    const sampledAll = nodes.filter((n) => typeof n.lastValidatedSeq === 'number');
-    const sampledOnline = sampledAll.filter((n) => n.isOnline && n.circuitState !== 'OPEN');
-    const sampledPool = sampledOnline.length > 0 ? sampledOnline : sampledAll;
-    const maxSafeLag = this.limits.maxSafeLedgerLag ?? 15;
-
-    let maxValidatedSeq = null;
-    let minValidatedSeq = null;
-    let safeValidatedSeq = null;
-
-    if (sampledPool.length > 0) {
-      for (const n of sampledPool) {
-        const seq = n.lastValidatedSeq;
-        if (maxValidatedSeq === null || seq > maxValidatedSeq) {
-          maxValidatedSeq = seq;
-        }
-        if (minValidatedSeq === null || seq < minValidatedSeq) {
-          minValidatedSeq = seq;
-        }
-      }
-      for (const n of sampledPool) {
-        const seq = n.lastValidatedSeq;
-        if (maxValidatedSeq - seq <= maxSafeLag) {
-          if (safeValidatedSeq === null || seq < safeValidatedSeq) {
-            safeValidatedSeq = seq;
-          }
-        }
-      }
-    }
+    const {
+      maxValidatedSeq,
+      minValidatedSeq,
+      safeValidatedSeq,
+      sampledLedgerNodes,
+    } = this.computeLedgerWatermarks(now);
 
     return {
       totalNodes: nodes.length,
@@ -1080,13 +1455,28 @@ export class NodeManager {
       maxValidatedSeq,
       minValidatedSeq,
       safeValidatedSeq,
-      sampledLedgerNodes: sampledAll.length,
+      safeBroadcastSeq: this.lastBroadcastSeq > 0 ? this.lastBroadcastSeq : safeValidatedSeq,
+      sampledLedgerNodes,
+      snapshotCacheSize: this.ledgerSnapshots.size,
       nodes,
     };
   }
 
   destroy() {
     this.rateQueue.clear();
+    this.onSafeLedgerAdvanced = null;
+    if (this.streamSettleTimer) {
+      clearTimeout(this.streamSettleTimer);
+      this.streamSettleTimer = null;
+    }
+    if (this.pendingLedgerSubWaiters.length > 0) {
+      const waiters = this.pendingLedgerSubWaiters.splice(0, this.pendingLedgerSubWaiters.length);
+      for (const w of waiters) {
+        clearTimeout(w.timer);
+        w.resolve(null);
+      }
+    }
+    this.ledgerSnapshots.clear();
     for (const [proxyId, entry] of this.pendingRequests.entries()) {
       clearTimeout(entry.timer);
       this.pendingRequests.delete(proxyId);

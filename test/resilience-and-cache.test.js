@@ -44,6 +44,7 @@ async function setupCluster(nodeSpecs, overrides = {}) {
       ledgerIndex: spec.ledgerIndex,
       clioMode: spec.clioMode,
       strictLedgerCheck: spec.strictLedgerCheck,
+      rejectSubscribe: spec.rejectSubscribe,
     });
     const wsUrl = await mock.start(0);
     mocks[spec.id] = mock;
@@ -59,6 +60,7 @@ async function setupCluster(nodeSpecs, overrides = {}) {
 
   const cfg = createConfig({
     server: { host: '127.0.0.1', port: 0, heartbeatIntervalMs: 0, statsLogIntervalMs: 0 },
+    ledgerStream: { enabled: false, shareWithClients: false },
     ...overrides,
     nodes,
   });
@@ -228,6 +230,7 @@ test('14. Request timeout triggers upstreamTimeout and graceful shutdown sends 1
 
   const cfg = createConfig({
     server: { host: '127.0.0.1', port: 0, heartbeatIntervalMs: 0, statsLogIntervalMs: 0 },
+    ledgerStream: { enabled: false, shareWithClients: false },
     limits: {
       requestTimeoutMs: 120,
       circuitBreakerThreshold: 5,
@@ -473,6 +476,387 @@ test('17. Strategy B safe-lag: ledger_closed prefers safe lagging node so subseq
     client.close();
   } finally {
     await env.teardown();
+  }
+});
+
+test('18. Upstream ledger stream pre-populates node heights so explicit ledger_index hits zero lgrNotFound', async () => {
+  const env = await setupCluster(
+    [
+      {
+        id: 'n-lag',
+        roles: ['normal'],
+        ledgerIndex: 92450098,
+        strictLedgerCheck: true,
+        rateLimit: { ratePerSec: 30, burst: 50 },
+      },
+      {
+        id: 'n-synced',
+        roles: ['normal'],
+        ledgerIndex: 92450100,
+        strictLedgerCheck: true,
+        rateLimit: { ratePerSec: 30, burst: 15 },
+      },
+    ],
+    {
+      cache: { enabled: false },
+      ledgerStream: { enabled: true, shareWithClients: true },
+    },
+  );
+
+  try {
+    // Wait briefly for pool[0] background ledger subscribe to populate initial heights
+    await new Promise((r) => setTimeout(r, 80));
+
+    const stats = env.proxy.getStats();
+    assert.equal(stats.nodes.find((n) => n.id === 'n-lag').lastValidatedSeq, 92450098);
+    assert.equal(stats.nodes.find((n) => n.id === 'n-synced').lastValidatedSeq, 92450100);
+
+    const lagCommandsBefore = env.mocks['n-lag'].receivedCommands.length;
+    const client = await connectClient(env.proxyUrl);
+
+    // Even on the very first client request, n-lag is skipped -> 0 lgrNotFound!
+    const res = await sendAndWait(client, {
+      id: 'zero-lgr',
+      command: 'account_lines',
+      account: 'rTest',
+      ledger_index: 92450100,
+    });
+    assert.equal(res.status, 'success');
+    assert.equal(res._mockNode, 'n-synced');
+    assert.equal(env.mocks['n-lag'].receivedCommands.length, lagCommandsBefore);
+
+    client.close();
+  } finally {
+    await env.teardown();
+  }
+});
+
+test('19. Shared ledger fan-out broadcasts monotonic safeBroadcastSeq and prevents lgrNotFound across nodes', async () => {
+  const env = await setupCluster(
+    [
+      {
+        id: 'n-fast',
+        roles: ['normal'],
+        ledgerIndex: 92450105,
+        strictLedgerCheck: true,
+        maxSubscribeConns: 0,
+      },
+      {
+        id: 'n-safe',
+        roles: ['normal'],
+        ledgerIndex: 92450102,
+        strictLedgerCheck: true,
+        maxSubscribeConns: 0,
+      },
+      {
+        id: 'n-outlier',
+        roles: ['normal'],
+        ledgerIndex: 92450070, // lag > maxSafeLedgerLag (15), ignored for safe watermark
+        strictLedgerCheck: true,
+        maxSubscribeConns: 0,
+      },
+    ],
+    {
+      cache: { enabled: false },
+      ledgerStream: { enabled: true, shareWithClients: true, maxSnapshots: 10 },
+    },
+  );
+
+  try {
+    await new Promise((r) => setTimeout(r, 80));
+
+    // Even with maxSubscribeConns: 0 on all nodes, 4 clients can subscribe to shared ledger stream
+    const clients = await Promise.all([
+      connectClient(env.proxyUrl),
+      connectClient(env.proxyUrl),
+      connectClient(env.proxyUrl),
+      connectClient(env.proxyUrl),
+    ]);
+
+    const eventsByClient = clients.map(() => []);
+    clients.forEach((ws, idx) => {
+      ws.on('message', (raw) => {
+        const msg = JSON.parse(raw.toString('utf8'));
+        if (msg.type === 'ledgerClosed') {
+          eventsByClient[idx].push(msg);
+        }
+      });
+    });
+
+    const subResponses = await Promise.all(
+      clients.map((ws, i) =>
+        sendAndWait(ws, { id: `sub-${i}`, command: 'subscribe', streams: ['ledger'] }),
+      ),
+    );
+
+    for (const r of subResponses) {
+      assert.equal(r.status, 'success');
+      assert.equal(r.result.ledger_index, 92450102);
+    }
+    assert.equal(env.proxy.getStats().sharedLedgerSubscribers, 4);
+    assert.ok(env.proxy.getStats().nodes.every((n) => n.activeSubscribeConns === 0));
+
+    // Fast node advances to 106 -> safe watermark stays at 102, so no premature 106 push!
+    env.mocks['n-fast'].emitLedgerClosed(92450106);
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(eventsByClient[0].length, 0);
+
+    // Safe node advances to 103 -> safe watermark advances to 103 -> all 4 clients receive #103 once!
+    env.mocks['n-safe'].emitLedgerClosed(92450103);
+    await new Promise((r) => setTimeout(r, 40));
+
+    for (const evts of eventsByClient) {
+      assert.equal(evts.length, 1);
+      assert.equal(evts[0].ledger_index, 92450103);
+    }
+
+    // Subsequent account_lines query at broadcasted 92450103 succeeds on both n-fast and n-safe!
+    const queryResp = await sendAndWait(clients[0], {
+      id: 'q-103',
+      command: 'account_lines',
+      ledger_index: 92450103,
+    });
+    assert.equal(queryResp.status, 'success');
+    assert.equal(queryResp.result.ledger_index, 92450103);
+
+    clients.forEach((c) => c.close());
+  } finally {
+    await env.teardown();
+  }
+});
+
+test('20. Shared ledger cleanup on unsubscribe and disconnect leaves zero leaked subscribers; mixed streams use 1:1 channel', async () => {
+  const env = await setupCluster(
+    [
+      {
+        id: 'n-main',
+        roles: ['normal'],
+        ledgerIndex: 92450200,
+        maxSubscribeConns: 2,
+      },
+    ],
+    {
+      ledgerStream: { enabled: true, shareWithClients: true },
+    },
+  );
+
+  try {
+    await new Promise((r) => setTimeout(r, 80));
+
+    const cShared = await connectClient(env.proxyUrl);
+    const cMixed = await connectClient(env.proxyUrl);
+
+    const r1 = await sendAndWait(cShared, {
+      id: 'sh-1',
+      command: 'subscribe',
+      streams: ['ledger'],
+    });
+    assert.equal(r1.status, 'success');
+    assert.equal(env.proxy.getStats().sharedLedgerSubscribers, 1);
+
+    // Unsubscribe from shared ledger without creating a 1:1 stateful channel
+    const u1 = await sendAndWait(cShared, {
+      id: 'unsub-1',
+      command: 'unsubscribe',
+      streams: ['ledger'],
+    });
+    assert.equal(u1.status, 'success');
+    assert.equal(env.proxy.getStats().sharedLedgerSubscribers, 0);
+    assert.equal(env.proxy.getStats().nodes[0].activeSubscribeConns, 0);
+
+    // Re-subscribe then abruptly close socket -> cleanupSession must clear count to 0
+    await sendAndWait(cShared, { id: 'sh-2', command: 'subscribe', streams: ['ledger'] });
+    assert.equal(env.proxy.getStats().sharedLedgerSubscribers, 1);
+
+    // Mixed subscription (ledger + transactions) uses 1:1 StatefulChannel
+    const rMix = await sendAndWait(cMixed, {
+      id: 'mix-1',
+      command: 'subscribe',
+      streams: ['ledger', 'transactions'],
+    });
+    assert.equal(rMix.status, 'success');
+    assert.equal(env.proxy.getStats().nodes[0].activeSubscribeConns, 1);
+    assert.equal(env.proxy.getStats().sharedLedgerSubscribers, 1);
+
+    cShared.close();
+    cMixed.close();
+    await new Promise((r) => setTimeout(r, 60));
+
+    const finalStats = env.proxy.getStats();
+    assert.equal(finalStats.sharedLedgerSubscribers, 0);
+    assert.equal(finalStats.clientConnections, 0);
+    assert.equal(finalStats.nodes[0].activeSubscribeConns, 0);
+  } finally {
+    await env.teardown();
+  }
+});
+
+test('21. Internal ledger subscribe rejection does not trip circuit breaker and snapshot cache stays bounded', async () => {
+  const env = await setupCluster(
+    [
+      {
+        id: 'n-reject-sub',
+        roles: ['normal'],
+        ledgerIndex: 92450300,
+        rejectSubscribe: true,
+      },
+      {
+        id: 'n-ok',
+        roles: ['normal'],
+        ledgerIndex: 92450300,
+      },
+    ],
+    {
+      limits: { circuitBreakerThreshold: 1 },
+      ledgerStream: { enabled: true, shareWithClients: true, maxSnapshots: 5 },
+    },
+  );
+
+  try {
+    await new Promise((r) => setTimeout(r, 80));
+
+    const statsBefore = env.proxy.getStats();
+    const rejectNodeStats = statsBefore.nodes.find((n) => n.id === 'n-reject-sub');
+    assert.equal(rejectNodeStats.circuitState, 'CLOSED');
+    assert.equal(rejectNodeStats.consecutiveFailures, 0);
+
+    // Push 12 ledgers from n-ok -> snapshot cache must remain bounded to maxSnapshots (5)
+    for (let seq = 92450301; seq <= 92450312; seq += 1) {
+      env.mocks['n-ok'].emitLedgerClosed(seq);
+    }
+    await new Promise((r) => setTimeout(r, 50));
+
+    const statsAfter = env.proxy.getStats();
+    assert.ok(
+      statsAfter.snapshotCacheSize <= 5,
+      `Expected snapshotCacheSize <= 5, got ${statsAfter.snapshotCacheSize}`,
+    );
+
+    await env.proxy.shutdown();
+    assert.equal(env.proxy.nodeManager.ledgerSnapshots.size, 0);
+  } finally {
+    await env.teardown();
+  }
+});
+
+test('22. Half-open dead upstream connection (missed pongs) is terminated, reconnected, and re-subscribes ledger stream', async () => {
+  const http = await import('node:http');
+  const { WebSocketServer } = await import('ws');
+
+  let connCount = 0;
+  let firstServerSocket = null;
+  let secondSubscribed = false;
+
+  const srv = http.createServer();
+  const wss = new WebSocketServer({ server: srv });
+  wss.on('connection', (ws) => {
+    connCount += 1;
+    const myIndex = connCount;
+    if (myIndex === 1) {
+      firstServerSocket = ws;
+    }
+
+    ws.on('message', (raw) => {
+      const req = JSON.parse(raw.toString('utf8'));
+      if (myIndex === 1) {
+        if (req.command === 'subscribe') {
+          ws.send(
+            JSON.stringify({
+              id: req.id,
+              status: 'success',
+              type: 'response',
+              result: { ledger_index: 92450500, validated_ledgers: '32570-92450500' },
+            }),
+          );
+          // Simulate half-open network freeze: stop reading frames so no pong/close is ever sent
+          ws._socket.pause();
+          ws._socket.removeAllListeners('data');
+        }
+        return;
+      }
+
+      if (req.command === 'subscribe') {
+        secondSubscribed = true;
+        ws.send(
+          JSON.stringify({
+            id: req.id,
+            status: 'success',
+            type: 'response',
+            result: { ledger_index: 92450505, validated_ledgers: '32570-92450505' },
+          }),
+        );
+      } else {
+        ws.send(
+          JSON.stringify({
+            id: req.id,
+            status: 'success',
+            type: 'response',
+            result: { recovered: true },
+          }),
+        );
+      }
+    });
+  });
+
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const port = srv.address().port;
+
+  const cfg = createConfig({
+    server: { host: '127.0.0.1', port: 0, heartbeatIntervalMs: 0, statsLogIntervalMs: 0 },
+    ledgerStream: { enabled: true, shareWithClients: true },
+    limits: {
+      upstreamPingIntervalMs: 60,
+      upstreamPongTimeoutMs: 30,
+      upstreamMaxMissedPongs: 2,
+      reconnectBaseDelayMs: 40,
+      reconnectMaxDelayMs: 80,
+      circuitBreakerThreshold: 5,
+    },
+    nodes: [
+      {
+        id: 'n-halfopen',
+        wsUrl: `ws://127.0.0.1:${port}/`,
+        roles: ['normal'],
+        poolSize: 1,
+        maxPathConns: 0,
+        maxSubscribeConns: 0,
+        rateLimit: { ratePerSec: 30, burst: 30 },
+      },
+    ],
+  });
+
+  const proxy = new ProxyServer(cfg);
+  const addr = await proxy.start();
+  const proxyUrl = `ws://127.0.0.1:${addr.port}/`;
+
+  try {
+    // Wait for initial connection -> 2 missed pongs -> terminate -> reconnect -> re-subscribe
+    const deadline = Date.now() + 3000;
+    while ((!secondSubscribed || connCount < 2) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+
+    assert.ok(connCount >= 2, `Expected reconnect attempt, connCount=${connCount}`);
+    assert.equal(secondSubscribed, true);
+    assert.equal(proxy.getStats().nodes[0].lastValidatedSeq, 92450505);
+
+    const client = await connectClient(proxyUrl);
+    const resp = await sendAndWait(client, { id: 'after-rec', command: 'account_info' });
+    assert.equal(resp.status, 'success');
+    assert.equal(resp.result.recovered, true);
+    client.close();
+  } finally {
+    if (firstServerSocket) {
+      try {
+        firstServerSocket.terminate();
+      } catch {
+        // ignore
+      }
+    }
+    await proxy.shutdown();
+    wss.clients.forEach((ws) => ws.terminate());
+    await new Promise((r) => wss.close(() => r()));
+    await new Promise((r) => srv.close(() => r()));
   }
 });
 

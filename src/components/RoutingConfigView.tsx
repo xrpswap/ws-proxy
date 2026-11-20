@@ -27,7 +27,10 @@ export function RoutingConfigView({ stats }: RoutingConfigViewProps) {
     { label: 'Max Path TTL', value: `${stats.limits.maxPathTtlMs} ms` },
     { label: 'Rate Queue Max Wait', value: `${stats.limits.queueMaxWaitMs} ms` },
     { label: 'Rate Queue Max Length', value: `${stats.limits.queueMaxLength} requests` },
-    { label: 'Upstream Keepalive Ping', value: `${stats.limits.upstreamPingIntervalMs} ms` },
+    {
+      label: 'Upstream Keepalive Ping',
+      value: `${stats.limits.upstreamPingIntervalMs} ms (pong ${stats.limits.upstreamPongTimeoutMs ?? 10000} ms × ${stats.limits.upstreamMaxMissedPongs ?? 2})`,
+    },
     {
       label: 'Reconnect Backoff Range',
       value: `${stats.limits.reconnectBaseDelayMs} ms – ${stats.limits.reconnectMaxDelayMs} ms`,
@@ -35,6 +38,16 @@ export function RoutingConfigView({ stats }: RoutingConfigViewProps) {
     { label: 'Max Safe Ledger Lag', value: `${stats.limits.maxSafeLedgerLag ?? 15} ledgers` },
     { label: 'Clio No-Current Cooldown', value: `${stats.limits.clioCooldownMs ?? 120000} ms` },
     { label: 'Cross-Node Ledger Retries', value: `${stats.limits.ledgerRetryMaxAttempts ?? 2} attempts` },
+    {
+      label: 'Upstream Ledger Stream',
+      value: stats.ledgerStream?.enabled ? 'Enabled' : 'Disabled',
+    },
+    {
+      label: 'Shared Ledger Fan-out',
+      value: stats.ledgerStream?.shareWithClients
+        ? `Enabled (${stats.sharedLedgerSubscribers ?? 0} active)`
+        : 'Disabled',
+    },
     { label: 'Max Connections / IP', value: `${stats.server.maxConnectionsPerIp}` },
     {
       label: 'Max WS Payload',
