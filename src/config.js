@@ -95,7 +95,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 2,
       maxSubscribeConns: 0,
-      rateLimit: { ratePerSec: 3, burst: 12 },
+      rateLimit: { ratePerSec: 3, burst: 15 },
     },
     {
       id: 'xrpl.ws',
@@ -104,7 +104,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 2,
       maxSubscribeConns: 0,
-      rateLimit: { ratePerSec: 3, burst: 15 },
+      rateLimit: { ratePerSec: 3, burst: 16 },
     },
     {
       id: 'xrpl.link',
