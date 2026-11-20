@@ -58,7 +58,7 @@ export const config = {
     requestTimeoutMs: 15000,
     nodeCooldownMs: 30000,
     maxPathTtlMs: 120000,
-    queueMaxWaitMs: 800,
+    queueMaxWaitMs: 1800,
     queueMaxLength: 200,
     circuitBreakerThreshold: 3,
     slowDownRecoveryMs: 15000,
@@ -99,7 +99,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 2,
       maxSubscribeConns: 0,
-      rateLimit: { ratePerSec: 3, burst: 15 },
+      rateLimit: { ratePerSec: 5, burst: 15 },
     },
     {
       id: 'xrpl.ws',
@@ -108,7 +108,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 2,
       maxSubscribeConns: 2,
-      rateLimit: { ratePerSec: 3, burst: 16 },
+      rateLimit: { ratePerSec: 5, burst: 16 },
     },
     {
       id: 'xrpl.link',
@@ -117,7 +117,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 0,
       maxSubscribeConns: 2,
-      rateLimit: { ratePerSec: 3, burst: 20 },
+      rateLimit: { ratePerSec: 5, burst: 20 },
     },
     {
       id: 'ripple-s1',
@@ -126,7 +126,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 0,
       maxSubscribeConns: 0,
-      rateLimit: { ratePerSec: 5, burst: 20 },
+      rateLimit: { ratePerSec: 10, burst: 20 },
     },
     {
       id: 'ripple-s2',
@@ -135,7 +135,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 0,
       maxSubscribeConns: 5,
-      rateLimit: { ratePerSec: 5, burst: 25 },
+      rateLimit: { ratePerSec: 10, burst: 25 },
     },
     {
       id: 'honeycluster',
@@ -144,7 +144,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 0,
       maxSubscribeConns: 5,
-      rateLimit: { ratePerSec: 5, burst: 20 },
+      rateLimit: { ratePerSec: 10, burst: 20 },
     },
   ],
 };
