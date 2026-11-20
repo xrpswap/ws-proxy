@@ -141,7 +141,7 @@ export const config = {
     {
       id: 'ripple-s2',
       wsUrl: 'wss://s2.ripple.com/',
-      roles: ['normal', 'history'],
+      roles: ['normal', 'history', 'submit'],
       poolSize: 1,
       maxPathConns: 0,
       maxSubscribeConns: 5,
