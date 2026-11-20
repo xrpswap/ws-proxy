@@ -105,16 +105,16 @@ export const config = {
     {
       id: 'xrplcluster',
       wsUrl: 'wss://xrplcluster.com/',
-      roles: ['normal', 'path'],
+      roles: ['normal', 'history', 'path'],
       poolSize: 1,
       maxPathConns: 2,
       maxSubscribeConns: 0,
-      rateLimit: { ratePerSec: 5, burst: 15 },
+      rateLimit: { ratePerSec: 5, burst: 16 },
     },
     {
       id: 'xrpl.ws',
       wsUrl: 'wss://xrpl.ws/',
-      roles: ['normal', 'path'],
+      roles: ['normal', 'history', 'path'],
       poolSize: 1,
       maxPathConns: 2,
       maxSubscribeConns: 2,
@@ -150,7 +150,7 @@ export const config = {
     {
       id: 'honeycluster',
       wsUrl: 'wss://honeycluster.io/',
-      roles: ['normal', 'history', 'submit'],
+      roles: ['normal', 'submit'],
       poolSize: 1,
       maxPathConns: 0,
       maxSubscribeConns: 5,
