@@ -131,6 +131,11 @@ async function main() {
     res.json({ ok: true, id: nodeId, loadWarningArmed: true });
   });
 
+  app.post('/api/nodes/probe-ledger', async (_req, res) => {
+    const results = await proxy.nodeManager.probeAllLedgers();
+    res.json({ ok: true, results });
+  });
+
   const httpServer = http.createServer(app);
 
   let vite: Awaited<ReturnType<typeof createViteServer>> | null = null;
@@ -166,6 +171,13 @@ async function main() {
   }
 
   await proxy.start({ httpServer });
+
+  const initialProbeTimer = setTimeout(() => {
+    void proxy.nodeManager.probeAllLedgers();
+  }, 600);
+  if (typeof initialProbeTimer.unref === 'function') {
+    initialProbeTimer.unref();
+  }
 
   await new Promise<void>((resolve) => {
     httpServer.listen(port, host, () => {

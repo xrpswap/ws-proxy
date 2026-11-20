@@ -8,8 +8,8 @@ interface KpiStripProps {
 export function KpiStrip({ stats, loading }: KpiStripProps) {
   if (loading && !stats) {
     return (
-      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-        {[0, 1, 2, 3].map((i) => (
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
+        {[0, 1, 2, 3, 4].map((i) => (
           <div
             key={i}
             className="bg-white border border-slate-200 rounded-lg p-5 h-[106px] animate-pulse"
@@ -33,8 +33,17 @@ export function KpiStrip({ stats, loading }: KpiStripProps) {
   const cacheHits = stats?.cache.hits ?? 0;
   const cacheCoalesced = stats?.cache.coalesced ?? 0;
 
+  const maxValidatedSeq = stats?.maxValidatedSeq ?? null;
+  const minValidatedSeq = stats?.minValidatedSeq ?? null;
+  const safeValidatedSeq = stats?.safeValidatedSeq ?? null;
+  const sampledLedgerNodes = stats?.sampledLedgerNodes ?? 0;
+  const maxLagSpread =
+    maxValidatedSeq !== null && minValidatedSeq !== null
+      ? Math.max(0, maxValidatedSeq - minValidatedSeq)
+      : null;
+
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
       <div className="bg-white border border-slate-200 rounded-lg p-5">
         <div className="text-xs font-medium text-slate-500">Healthy Upstream Nodes</div>
         <div className="mt-2 flex items-baseline gap-2 font-mono tabular-nums">
@@ -45,6 +54,20 @@ export function KpiStrip({ stats, loading }: KpiStripProps) {
           {totalNodes - healthyNodes === 0
             ? 'All pools nominal'
             : `${totalNodes - healthyNodes} degraded or open`}
+        </div>
+      </div>
+
+      <div className="bg-white border border-slate-200 rounded-lg p-5">
+        <div className="text-xs font-medium text-slate-500">Cluster Ledger Height</div>
+        <div className="mt-2 flex items-baseline gap-2 font-mono tabular-nums">
+          <span className="text-2xl font-semibold text-slate-900">
+            {maxValidatedSeq !== null ? `#${maxValidatedSeq}` : '—'}
+          </span>
+        </div>
+        <div className="mt-1.5 text-xs text-slate-500 font-mono tabular-nums truncate">
+          {maxValidatedSeq !== null
+            ? `Safe #${safeValidatedSeq ?? maxValidatedSeq} · Δ${maxLagSpread ?? 0} · ${sampledLedgerNodes}/${totalNodes}`
+            : `0/${totalNodes} nodes sampled`}
         </div>
       </div>
 

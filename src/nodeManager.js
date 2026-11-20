@@ -8,6 +8,24 @@ function createProxyError(code, message) {
   return err;
 }
 
+function isClioCurrentRejection(msg) {
+  return Boolean(
+    msg &&
+      msg.status === 'error' &&
+      typeof msg.error_message === 'string' &&
+      /clio/i.test(msg.error_message) &&
+      /validated/i.test(msg.error_message),
+  );
+}
+
+function isLedgerNotFoundError(msg) {
+  return Boolean(
+    msg &&
+      msg.status === 'error' &&
+      (msg.error === 'lgrNotFound' || msg.error === 'ledgerNotFound'),
+  );
+}
+
 class UpstreamPoolConnection {
   constructor(node, index, manager) {
     this.node = node;
@@ -53,6 +71,7 @@ class UpstreamPoolConnection {
       if (this.destroyed || this.ws !== ws) return;
       this.reconnectAttempts = 0;
       this.hasConnectedOnce = true;
+      this.node.onPoolConnected();
       this.startPing();
       this.flushOutboundQueue();
     };
@@ -249,12 +268,61 @@ export class NodeRuntime {
     this.activePathConns = 0;
     this.activeSubscribeConns = 0;
 
-    // Telemetry
+    // Telemetry & ledger capability learning
     this.totalRequests = 0;
     this.totalErrors = 0;
     this.requestTimestamps = [];
     this.lastLoadWarningAt = null;
     this.lastErrorMessage = null;
+    this.lastValidatedSeq = null;
+    this.lastValidatedAt = null;
+    this.clioVersion = null;
+    this.currentRejectedUntil = 0;
+  }
+
+  onPoolConnected() {
+    this.currentRejectedUntil = 0;
+    this.clioVersion = null;
+  }
+
+  isCurrentRejected(now = Date.now()) {
+    return this.currentRejectedUntil > now;
+  }
+
+  markCurrentRejected(cooldownMs = this.limits.clioCooldownMs ?? 120000) {
+    this.currentRejectedUntil = Date.now() + cooldownMs;
+  }
+
+  updateLedgerTelemetry(msg) {
+    if (!msg || typeof msg !== 'object' || msg.status === 'error') return;
+    const result = msg.result;
+    if (!result || typeof result !== 'object') return;
+
+    if (typeof result.info?.clio_version === 'string') {
+      this.clioVersion = result.info.clio_version;
+    }
+
+    let seq = null;
+    if (
+      typeof result.info?.validated_ledger?.seq === 'number' &&
+      Number.isFinite(result.info.validated_ledger.seq)
+    ) {
+      seq = Math.trunc(result.info.validated_ledger.seq);
+    } else if (
+      typeof result.ledger_index === 'number' &&
+      Number.isFinite(result.ledger_index) &&
+      (result.validated === true ||
+        (typeof result.ledger_hash === 'string' &&
+          result.ledger_current_index === undefined))
+    ) {
+      seq = Math.trunc(result.ledger_index);
+    }
+
+    if (seq !== null && seq > 0) {
+      this.lastValidatedSeq =
+        this.lastValidatedSeq === null ? seq : Math.max(this.lastValidatedSeq, seq);
+      this.lastValidatedAt = Date.now();
+    }
   }
 
   startPool() {
@@ -478,6 +546,13 @@ export class NodeRuntime {
       totalErrors: this.totalErrors,
       qps: this.getQps(now),
       lastLoadWarningAt: this.lastLoadWarningAt,
+      lastValidatedSeq: this.lastValidatedSeq,
+      lastValidatedAt: this.lastValidatedAt,
+      clioVersion: this.clioVersion,
+      currentRejectedCooldownSec:
+        this.currentRejectedUntil > now
+          ? Math.ceil((this.currentRejectedUntil - now) / 1000)
+          : 0,
     };
   }
 
@@ -521,16 +596,29 @@ export class NodeManager {
     return this.nodeMap.get(id) || null;
   }
 
-  getEligibleStatelessNodes(role) {
+  getEligibleStatelessNodes(role, excludedNodeIds = null) {
     const roleNodes = this.nodes.filter((n) => n.hasRole(role));
     const healthyConnected = roleNodes.filter(
-      (n) => n.isHealthyForTraffic() && n.hasAvailablePoolConnection(),
+      (n) =>
+        n.isHealthyForTraffic() &&
+        n.hasAvailablePoolConnection() &&
+        (!excludedNodeIds || !excludedNodeIds.has(n.id)),
     );
     return { roleNodes, healthyConnected };
   }
 
-  tryAcquireStatelessCandidate(role, weight) {
-    const { roleNodes, healthyConnected } = this.getEligibleStatelessNodes(role);
+  tryAcquireStatelessCandidate(role, weight, options = {}) {
+    const {
+      excludedNodeIds = null,
+      requestedLedgerIndex = null,
+      requiresCurrent = false,
+      preferSafeLag = false,
+    } = options;
+
+    const { roleNodes, healthyConnected } = this.getEligibleStatelessNodes(
+      role,
+      excludedNodeIds,
+    );
     if (roleNodes.length === 0 || healthyConnected.length === 0) {
       throw createProxyError(
         'noNodesAvailable',
@@ -539,10 +627,54 @@ export class NodeManager {
     }
 
     const now = Date.now();
-    const sorted = [...healthyConnected].sort((a, b) => {
+    let candidates = healthyConnected;
+
+    if (requiresCurrent) {
+      const nonClio = candidates.filter((n) => !n.isCurrentRejected(now));
+      if (nonClio.length > 0) {
+        candidates = nonClio;
+      }
+    }
+
+    if (requestedLedgerIndex !== null && requestedLedgerIndex !== undefined) {
+      const synced = candidates.filter(
+        (n) => n.lastValidatedSeq === null || n.lastValidatedSeq >= requestedLedgerIndex,
+      );
+      if (synced.length > 0) {
+        candidates = synced;
+      }
+    }
+
+    let maxSeq = null;
+    if (preferSafeLag) {
+      for (const n of candidates) {
+        if (n.lastValidatedSeq !== null) {
+          maxSeq = maxSeq === null ? n.lastValidatedSeq : Math.max(maxSeq, n.lastValidatedSeq);
+        }
+      }
+    }
+    const maxSafeLag = this.limits.maxSafeLedgerLag ?? 15;
+
+    const sorted = [...candidates].sort((a, b) => {
       const aOpen = a.hasOpenPoolConnection() ? 1 : 0;
       const bOpen = b.hasOpenPoolConnection() ? 1 : 0;
       if (aOpen !== bOpen) return bOpen - aOpen;
+
+      if (preferSafeLag && maxSeq !== null) {
+        const aUnknown = a.lastValidatedSeq === null;
+        const bUnknown = b.lastValidatedSeq === null;
+        if (aUnknown !== bUnknown) return aUnknown ? -1 : 1;
+
+        const aSafe =
+          a.lastValidatedSeq !== null && maxSeq - a.lastValidatedSeq <= maxSafeLag;
+        const bSafe =
+          b.lastValidatedSeq !== null && maxSeq - b.lastValidatedSeq <= maxSafeLag;
+        if (aSafe !== bSafe) return aSafe ? -1 : 1;
+        if (aSafe && bSafe && a.lastValidatedSeq !== b.lastValidatedSeq) {
+          return a.lastValidatedSeq - b.lastValidatedSeq;
+        }
+      }
+
       return b.bucket.getAvailableTokens(now) - a.bucket.getAvailableTokens(now);
     });
 
@@ -561,17 +693,24 @@ export class NodeManager {
     return null;
   }
 
-  async acquireStateless(role, weight) {
-    const immediate = this.tryAcquireStatelessCandidate(role, weight);
+  async acquireStateless(role, weight, options = {}) {
+    const immediate = this.tryAcquireStatelessCandidate(role, weight, options);
     if (immediate) {
       return immediate;
     }
-    return this.rateQueue.enqueue(() => this.tryAcquireStatelessCandidate(role, weight));
+    return this.rateQueue.enqueue(() =>
+      this.tryAcquireStatelessCandidate(role, weight, options),
+    );
   }
 
-  async sendStatelessRequest(payload, role, weight) {
+  async sendSingleStatelessAttempt(payload, routeInfo, excludedNodeIds) {
     const { hasOriginalId, originalId } = extractRequestId(payload);
-    const { node, conn } = await this.acquireStateless(role, weight);
+    const { node, conn } = await this.acquireStateless(routeInfo.role, routeInfo.weight, {
+      excludedNodeIds,
+      requestedLedgerIndex: routeInfo.requestedLedgerIndex,
+      requiresCurrent: routeInfo.requiresCurrent,
+      preferSafeLag: routeInfo.preferSafeLag,
+    });
 
     node.recordRequestStart();
     const proxyId = this.nextProxyId++;
@@ -605,7 +744,7 @@ export class NodeManager {
         nodeId: node.id,
         node,
         conn,
-        resolve,
+        resolve: (restored) => resolve({ node, response: restored }),
         reject,
       });
 
@@ -625,6 +764,71 @@ export class NodeManager {
         );
       }
     });
+  }
+
+  async sendStatelessRequest(payload, roleOrRouteInfo, weightArg) {
+    const routeInfo =
+      typeof roleOrRouteInfo === 'string'
+        ? {
+            role: roleOrRouteInfo,
+            weight: weightArg ?? 2,
+            requestedLedgerIndex: null,
+            requiresCurrent: false,
+            preferSafeLag: false,
+          }
+        : roleOrRouteInfo;
+
+    const maxAttempts = 1 + (this.limits.ledgerRetryMaxAttempts ?? 2);
+    const excludedNodeIds = new Set();
+    let lastResponse = null;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      let attemptResult;
+      try {
+        attemptResult = await this.sendSingleStatelessAttempt(
+          payload,
+          routeInfo,
+          excludedNodeIds,
+        );
+      } catch (err) {
+        if (lastResponse && err.code === 'noNodesAvailable') {
+          return lastResponse;
+        }
+        throw err;
+      }
+
+      const { node, response } = attemptResult;
+      lastResponse = response;
+
+      if (isClioCurrentRejection(response)) {
+        node.markCurrentRejected(this.limits.clioCooldownMs);
+        excludedNodeIds.add(node.id);
+        const { healthyConnected } = this.getEligibleStatelessNodes(
+          routeInfo.role,
+          excludedNodeIds,
+        );
+        if (healthyConnected.length > 0 && attempt + 1 < maxAttempts) {
+          continue;
+        }
+        return response;
+      }
+
+      if (isLedgerNotFoundError(response)) {
+        excludedNodeIds.add(node.id);
+        const { healthyConnected } = this.getEligibleStatelessNodes(
+          routeInfo.role,
+          excludedNodeIds,
+        );
+        if (healthyConnected.length > 0 && attempt + 1 < maxAttempts) {
+          continue;
+        }
+        return response;
+      }
+
+      return response;
+    }
+
+    return lastResponse;
   }
 
   handlePoolMessage(node, _conn, rawData) {
@@ -649,6 +853,8 @@ export class NodeManager {
     if (node.circuitState === 'HALF_OPEN') {
       node.halfOpenInFlight = false;
     }
+
+    node.updateLedgerTelemetry(msg);
 
     // Load signal sniffing
     const isLoadWarning = msg.warning === 'load';
@@ -772,6 +978,59 @@ export class NodeManager {
     });
   }
 
+  async probeNodeLedger(node) {
+    if (!node || !node.isHealthyForTraffic() || !node.hasAvailablePoolConnection()) {
+      return null;
+    }
+    const conn = node.pickPoolConnection();
+    if (!conn) return null;
+
+    const proxyId = this.nextProxyId++;
+    const upstreamPayload = { id: proxyId, command: 'server_info' };
+
+    return new Promise((resolve) => {
+      const timeoutMs = Math.min(this.limits.requestTimeoutMs ?? 5000, 5000);
+      const timer = setTimeout(() => {
+        const entry = this.pendingRequests.get(proxyId);
+        if (!entry) return;
+        this.pendingRequests.delete(proxyId);
+        resolve(null);
+      }, timeoutMs);
+
+      if (typeof timer.unref === 'function') {
+        timer.unref();
+      }
+
+      this.pendingRequests.set(proxyId, {
+        originalId: proxyId,
+        hasOriginalId: true,
+        timer,
+        nodeId: node.id,
+        node,
+        conn,
+        resolve: () => resolve(node.lastValidatedSeq),
+        reject: () => resolve(null),
+      });
+
+      const sent = conn.sendRaw(JSON.stringify(upstreamPayload));
+      if (!sent) {
+        clearTimeout(timer);
+        this.pendingRequests.delete(proxyId);
+        resolve(null);
+      }
+    });
+  }
+
+  async probeAllLedgers() {
+    const results = await Promise.all(
+      this.nodes.map(async (node) => ({
+        id: node.id,
+        lastValidatedSeq: await this.probeNodeLedger(node),
+      })),
+    );
+    return results;
+  }
+
   getStats() {
     const now = Date.now();
     const nodes = this.nodes.map((n) => n.getStats(now));
@@ -782,6 +1041,35 @@ export class NodeManager {
       nodes.reduce((sum, n) => sum + n.qps, 0).toFixed(2),
     );
 
+    const sampledAll = nodes.filter((n) => typeof n.lastValidatedSeq === 'number');
+    const sampledOnline = sampledAll.filter((n) => n.isOnline && n.circuitState !== 'OPEN');
+    const sampledPool = sampledOnline.length > 0 ? sampledOnline : sampledAll;
+    const maxSafeLag = this.limits.maxSafeLedgerLag ?? 15;
+
+    let maxValidatedSeq = null;
+    let minValidatedSeq = null;
+    let safeValidatedSeq = null;
+
+    if (sampledPool.length > 0) {
+      for (const n of sampledPool) {
+        const seq = n.lastValidatedSeq;
+        if (maxValidatedSeq === null || seq > maxValidatedSeq) {
+          maxValidatedSeq = seq;
+        }
+        if (minValidatedSeq === null || seq < minValidatedSeq) {
+          minValidatedSeq = seq;
+        }
+      }
+      for (const n of sampledPool) {
+        const seq = n.lastValidatedSeq;
+        if (maxValidatedSeq - seq <= maxSafeLag) {
+          if (safeValidatedSeq === null || seq < safeValidatedSeq) {
+            safeValidatedSeq = seq;
+          }
+        }
+      }
+    }
+
     return {
       totalNodes: nodes.length,
       healthyNodes,
@@ -789,6 +1077,10 @@ export class NodeManager {
       pendingRequests: this.pendingRequests.size,
       nextProxyId: this.nextProxyId,
       rateQueueLength: this.rateQueue.length,
+      maxValidatedSeq,
+      minValidatedSeq,
+      safeValidatedSeq,
+      sampledLedgerNodes: sampledAll.length,
       nodes,
     };
   }

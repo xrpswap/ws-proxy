@@ -65,6 +65,9 @@ export const config = {
     upstreamPingIntervalMs: 25000,
     reconnectBaseDelayMs: 500,
     reconnectMaxDelayMs: 15000,
+    clioCooldownMs: 120000,
+    ledgerRetryMaxAttempts: 2,
+    maxSafeLedgerLag: 15,
   },
   routing: {
     pathCommands: ['path_find', 'ripple_path_find'],
@@ -79,6 +82,7 @@ export const config = {
     submitCommands: ['submit', 'submit_multisigned', 'sign_and_submit'],
     statefulCommands: ['path_find', 'subscribe', 'unsubscribe'],
     routeExplicitLedgerToHistory: false,
+    preferSafeLagForLedgerClosed: true,
     defaultWeight: 2,
     commandWeights: { ...DEFAULT_COMMAND_WEIGHTS },
   },
@@ -127,10 +131,10 @@ export const config = {
     {
       id: 'ripple-s2',
       wsUrl: 'wss://s2.ripple.com/',
-      roles: ['history'],
+      roles: ['normal', 'history'],
       poolSize: 1,
       maxPathConns: 0,
-      maxSubscribeConns: 0,
+      maxSubscribeConns: 5,
       rateLimit: { ratePerSec: 5, burst: 25 },
     },
     {

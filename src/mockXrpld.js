@@ -2,10 +2,18 @@ import http from 'node:http';
 import { WebSocketServer } from 'ws';
 
 export class MockXrpldNode {
-  constructor({ id = 'mock-node', roles = ['normal'], ledgerIndex = 92450100 } = {}) {
+  constructor({
+    id = 'mock-node',
+    roles = ['normal'],
+    ledgerIndex = 92450100,
+    clioMode = false,
+    strictLedgerCheck = false,
+  } = {}) {
     this.id = id;
     this.roles = roles;
     this.ledgerIndex = ledgerIndex;
+    this.clioMode = clioMode;
+    this.strictLedgerCheck = strictLedgerCheck;
     this.server = null;
     this.wss = null;
     this.port = 0;
@@ -103,12 +111,47 @@ export class MockXrpldNode {
       response.warning = 'load';
     }
 
+    if (
+      this.clioMode &&
+      (req?.ledger_index === 'current' || cmd === 'ledger_current')
+    ) {
+      const clioErr = {
+        status: 'error',
+        type: 'response',
+        error: 'invalidParams',
+        error_message:
+          "This is a clio server. clio only serves validated data. If you want to talk to rippled, include 'ledger_index':'current' in your request",
+        _mockNode: this.id,
+      };
+      if (req.id !== undefined && req.id !== null) clioErr.id = req.id;
+      if (ws.readyState === 1) ws.send(JSON.stringify(clioErr));
+      return;
+    }
+
+    if (
+      this.strictLedgerCheck &&
+      typeof req?.ledger_index === 'number' &&
+      req.ledger_index > this.ledgerIndex
+    ) {
+      const lgrErr = {
+        status: 'error',
+        type: 'response',
+        error: 'lgrNotFound',
+        error_message: 'ledgerNotFound',
+        _mockNode: this.id,
+      };
+      if (req.id !== undefined && req.id !== null) lgrErr.id = req.id;
+      if (ws.readyState === 1) ws.send(JSON.stringify(lgrErr));
+      return;
+    }
+
     switch (cmd) {
       case 'server_info':
         response.result = {
           info: {
             build_version: '2.3.0',
-            complete_ledgers: '32570-92450100',
+            ...(this.clioMode ? { clio_version: '2.2.0' } : {}),
+            complete_ledgers: `32570-${this.ledgerIndex}`,
             hostid: this.id,
             io_latency_ms: 1,
             server_state: 'full',
@@ -144,8 +187,18 @@ export class MockXrpldNode {
             Balance: '100000000',
             Sequence: 42,
           },
-          ledger_index: req.ledger_index || this.ledgerIndex,
+          ledger_index:
+            typeof req.ledger_index === 'number' ? req.ledger_index : this.ledgerIndex,
           validated: true,
+        };
+        break;
+      case 'account_lines':
+        response.result = {
+          account: req.account || 'rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe',
+          lines: [],
+          ledger_index:
+            typeof req.ledger_index === 'number' ? req.ledger_index : this.ledgerIndex,
+          validated: req.ledger_index !== 'current',
         };
         break;
       case 'account_tx':

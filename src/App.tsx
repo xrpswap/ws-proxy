@@ -159,7 +159,12 @@ export default function App() {
 
           <KpiStrip stats={stats} loading={loading} />
 
-          <NodeTopologyTable nodes={stats?.nodes ?? []} readOnly />
+          <NodeTopologyTable
+            nodes={stats?.nodes ?? []}
+            maxValidatedSeq={stats?.maxValidatedSeq}
+            maxSafeLedgerLag={stats?.limits?.maxSafeLedgerLag}
+            readOnly
+          />
         </main>
       </div>
     );
@@ -276,6 +281,12 @@ export default function App() {
                 Healthy {stats?.healthyNodes ?? 0}/{stats?.totalNodes ?? 0}
               </span>
             </div>
+            <div>
+              Ledger{' '}
+              <span className="text-slate-900 font-medium">
+                {stats?.maxValidatedSeq != null ? `#${stats.maxValidatedSeq}` : '—'}
+              </span>
+            </div>
             <div>Clients {stats?.clientConnections ?? 0}</div>
             <div>QPS {(stats?.totalQps ?? 0).toFixed(1)}</div>
             <div>Pending {stats?.pendingRequests ?? 0}</div>
@@ -302,6 +313,8 @@ export default function App() {
               <KpiStrip stats={stats} loading={loading} />
               <NodeTopologyTable
                 nodes={stats?.nodes ?? []}
+                maxValidatedSeq={stats?.maxValidatedSeq}
+                maxSafeLedgerLag={stats?.limits?.maxSafeLedgerLag}
                 onActionComplete={() => void fetchStats()}
               />
             </>

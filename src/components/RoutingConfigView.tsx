@@ -32,6 +32,9 @@ export function RoutingConfigView({ stats }: RoutingConfigViewProps) {
       label: 'Reconnect Backoff Range',
       value: `${stats.limits.reconnectBaseDelayMs} ms – ${stats.limits.reconnectMaxDelayMs} ms`,
     },
+    { label: 'Max Safe Ledger Lag', value: `${stats.limits.maxSafeLedgerLag ?? 15} ledgers` },
+    { label: 'Clio No-Current Cooldown', value: `${stats.limits.clioCooldownMs ?? 120000} ms` },
+    { label: 'Cross-Node Ledger Retries', value: `${stats.limits.ledgerRetryMaxAttempts ?? 2} attempts` },
     { label: 'Max Connections / IP', value: `${stats.server.maxConnectionsPerIp}` },
     {
       label: 'Max WS Payload',
@@ -56,17 +59,31 @@ export function RoutingConfigView({ stats }: RoutingConfigViewProps) {
                 Active instruction routing matrix by backend node capability
               </p>
             </div>
-            <div className="text-xs font-mono text-slate-700 whitespace-nowrap">
-              Explicit Ledger → History:{' '}
-              <span
-                className={
-                  stats.routing.routeExplicitLedgerToHistory
-                    ? 'text-emerald-700 font-semibold'
-                    : 'text-slate-500'
-                }
-              >
-                {stats.routing.routeExplicitLedgerToHistory ? 'ON' : 'OFF'}
-              </span>
+            <div className="text-xs font-mono text-slate-700 whitespace-nowrap text-right">
+              <div>
+                Explicit Ledger → History:{' '}
+                <span
+                  className={
+                    stats.routing.routeExplicitLedgerToHistory
+                      ? 'text-emerald-700 font-semibold'
+                      : 'text-slate-500'
+                  }
+                >
+                  {stats.routing.routeExplicitLedgerToHistory ? 'ON' : 'OFF'}
+                </span>
+              </div>
+              <div className="text-[11px] text-slate-500 mt-0.5">
+                Safe Lag (ledger_closed):{' '}
+                <span
+                  className={
+                    stats.routing.preferSafeLagForLedgerClosed
+                      ? 'text-emerald-700 font-semibold'
+                      : 'text-slate-500'
+                  }
+                >
+                  {stats.routing.preferSafeLagForLedgerClosed ? 'ON' : 'OFF'}
+                </span>
+              </div>
             </div>
           </div>
 

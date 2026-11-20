@@ -121,10 +121,13 @@ test('1. Command routing directs commands to matching node roles', async () => {
 });
 
 test('2. Explicit numeric ledger_index or ledger_hash routes non-stateful requests to history', async () => {
-  const env = await setupCluster([
-    { id: 'n-normal', roles: ['normal'] },
-    { id: 'n-history', roles: ['history'] },
-  ]);
+  const env = await setupCluster(
+    [
+      { id: 'n-normal', roles: ['normal'] },
+      { id: 'n-history', roles: ['history'] },
+    ],
+    { routing: { routeExplicitLedgerToHistory: true } },
+  );
 
   try {
     const client = await connectClient(env.proxyUrl);

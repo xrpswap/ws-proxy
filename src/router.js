@@ -1,3 +1,16 @@
+function parseExplicitLedgerIndex(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+  if (typeof payload.ledger_index === 'number' && Number.isFinite(payload.ledger_index)) {
+    return Math.trunc(payload.ledger_index);
+  }
+  if (typeof payload.ledger_index === 'string' && /^\d+$/.test(payload.ledger_index.trim())) {
+    return Number(payload.ledger_index.trim());
+  }
+  return null;
+}
+
 function hasExplicitLedger(payload) {
   if (!payload || typeof payload !== 'object') {
     return false;
@@ -5,13 +18,7 @@ function hasExplicitLedger(payload) {
   if (typeof payload.ledger_hash === 'string' && payload.ledger_hash.trim().length > 0) {
     return true;
   }
-  if (typeof payload.ledger_index === 'number' && Number.isFinite(payload.ledger_index)) {
-    return true;
-  }
-  if (typeof payload.ledger_index === 'string' && /^\d+$/.test(payload.ledger_index.trim())) {
-    return true;
-  }
-  return false;
+  return parseExplicitLedgerIndex(payload) !== null;
 }
 
 export function classifyRequest(payload, routingConfig, cacheConfig) {
@@ -48,6 +55,13 @@ export function classifyRequest(payload, routingConfig, cacheConfig) {
     Array.isArray(cacheConfig.commands) &&
     cacheConfig.commands.includes(command);
 
+  const requestedLedgerIndex = parseExplicitLedgerIndex(payload);
+  const requiresCurrent =
+    payload?.ledger_index === 'current' || command === 'ledger_current';
+  const preferSafeLag =
+    Boolean(routingConfig.preferSafeLagForLedgerClosed) &&
+    (command === 'ledger_closed' || command === 'server_info');
+
   return {
     command,
     role,
@@ -55,5 +69,8 @@ export function classifyRequest(payload, routingConfig, cacheConfig) {
     statefulKind,
     weight,
     isCacheable,
+    requestedLedgerIndex,
+    requiresCurrent,
+    preferSafeLag,
   };
 }

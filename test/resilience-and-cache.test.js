@@ -38,7 +38,13 @@ async function setupCluster(nodeSpecs, overrides = {}) {
   const mocks = {};
   const nodes = [];
   for (const spec of nodeSpecs) {
-    const mock = new MockXrpldNode({ id: spec.id, roles: spec.roles });
+    const mock = new MockXrpldNode({
+      id: spec.id,
+      roles: spec.roles,
+      ledgerIndex: spec.ledgerIndex,
+      clioMode: spec.clioMode,
+      strictLedgerCheck: spec.strictLedgerCheck,
+    });
     const wsUrl = await mock.start(0);
     mocks[spec.id] = mock;
     nodes.push({
@@ -264,3 +270,209 @@ test('14. Request timeout triggers upstreamTimeout and graceful shutdown sends 1
     await new Promise((r) => slowHttp.close(() => r()));
   }
 });
+
+test('15. Clio auto-detection & non-mutating recovery: retries unmodified current request on rippled and cools down Clio node', async () => {
+  const env = await setupCluster(
+    [
+      {
+        id: 'n-clio-s2',
+        roles: ['normal'],
+        clioMode: true,
+        rateLimit: { ratePerSec: 30, burst: 50 },
+      },
+      {
+        id: 'n-rippled',
+        roles: ['normal'],
+        clioMode: false,
+        rateLimit: { ratePerSec: 30, burst: 10 },
+      },
+    ],
+    {
+      limits: {
+        clioCooldownMs: 5000,
+        circuitBreakerThreshold: 2,
+      },
+    },
+  );
+
+  try {
+    const client = await connectClient(env.proxyUrl);
+
+    // First request lands on n-clio-s2 (highest tokens=50), gets Clio rejection,
+    // transparently retries unmodified request on n-rippled and succeeds
+    const r1 = await sendAndWait(client, {
+      id: 'cur-1',
+      command: 'account_lines',
+      account: 'rTest',
+      ledger_index: 'current',
+    });
+    assert.equal(r1.status, 'success');
+    assert.equal(r1._mockNode, 'n-rippled');
+    assert.equal(r1.id, 'cur-1');
+
+    // Verify request payload forwarded to n-rippled was NOT mutated
+    const rippledReq = env.mocks['n-rippled'].receivedCommands.find(
+      (c) => c.command === 'account_lines',
+    );
+    assert.equal(rippledReq.ledger_index, 'current');
+
+    // Verify Clio node was NOT tripped to OPEN circuit, only marked with current cooldown
+    const clioStats = env.proxy.getStats().nodes.find((n) => n.id === 'n-clio-s2');
+    assert.equal(clioStats.circuitState, 'CLOSED');
+    assert.ok(clioStats.currentRejectedCooldownSec > 0);
+
+    // Next ledger_index: "current" skips n-clio-s2 immediately without hitting Clio
+    const clioCallsBefore = env.mocks['n-clio-s2'].receivedCommands.length;
+    const r2 = await sendAndWait(client, {
+      id: 'cur-2',
+      command: 'account_lines',
+      account: 'rTest',
+      ledger_index: 'current',
+    });
+    assert.equal(r2.status, 'success');
+    assert.equal(r2._mockNode, 'n-rippled');
+    assert.equal(env.mocks['n-clio-s2'].receivedCommands.length, clioCallsBefore);
+
+    // Validated queries still use high-capacity n-clio-s2
+    const rVal = await sendAndWait(client, {
+      id: 'val-1',
+      command: 'account_lines',
+      account: 'rTest',
+      ledger_index: 'validated',
+    });
+    assert.equal(rVal.status, 'success');
+    assert.equal(rVal._mockNode, 'n-clio-s2');
+
+    client.close();
+  } finally {
+    await env.teardown();
+  }
+});
+
+test('16. Strategy B: lgrNotFound triggers transparent retry on synced node and learns lastValidatedSeq filtering', async () => {
+  const env = await setupCluster(
+    [
+      {
+        id: 'n-lagging-s2',
+        roles: ['normal', 'history'],
+        ledgerIndex: 92450098,
+        strictLedgerCheck: true,
+        rateLimit: { ratePerSec: 30, burst: 50 },
+      },
+      {
+        id: 'n-synced',
+        roles: ['normal', 'history'],
+        ledgerIndex: 92450100,
+        strictLedgerCheck: true,
+        rateLimit: { ratePerSec: 30, burst: 15 },
+      },
+    ],
+    {
+      cache: { enabled: false },
+    },
+  );
+
+  try {
+    const client = await connectClient(env.proxyUrl);
+
+    // Client requests ledger 92450100: n-lagging-s2 has more tokens so tries first -> lgrNotFound,
+    // proxy transparently retries exact payload on n-synced and succeeds!
+    const r1 = await sendAndWait(client, {
+      id: 'lgr-1',
+      command: 'account_lines',
+      account: 'rTest',
+      ledger_index: 92450100,
+    });
+    assert.equal(r1.status, 'success');
+    assert.equal(r1._mockNode, 'n-synced');
+    assert.equal(r1.result.ledger_index, 92450100);
+
+    // Refresh n-lagging-s2 telemetry via account_info at validated (92450098)
+    const rLagInfo = await sendAndWait(client, {
+      id: 'lag-info',
+      command: 'account_info',
+      account: 'rTest',
+    });
+    assert.equal(rLagInfo._mockNode, 'n-lagging-s2');
+
+    const stats = env.proxy.getStats();
+    assert.equal(
+      stats.nodes.find((n) => n.id === 'n-lagging-s2').lastValidatedSeq,
+      92450098,
+    );
+    assert.equal(
+      stats.nodes.find((n) => n.id === 'n-synced').lastValidatedSeq,
+      92450100,
+    );
+
+    // Now requesting 92450100 directly filters out n-lagging-s2 (92450098 < 92450100)
+    const lagCallsBefore = env.mocks['n-lagging-s2'].receivedCommands.length;
+    const r2 = await sendAndWait(client, {
+      id: 'lgr-2',
+      command: 'account_lines',
+      account: 'rTest',
+      ledger_index: 92450100,
+    });
+    assert.equal(r2.status, 'success');
+    assert.equal(r2._mockNode, 'n-synced');
+    assert.equal(env.mocks['n-lagging-s2'].receivedCommands.length, lagCallsBefore);
+
+    client.close();
+  } finally {
+    await env.teardown();
+  }
+});
+
+test('17. Strategy B safe-lag: ledger_closed prefers safe lagging node so subsequent requests succeed on all nodes', async () => {
+  const env = await setupCluster(
+    [
+      {
+        id: 'n-fast',
+        roles: ['normal'],
+        ledgerIndex: 92450105,
+        strictLedgerCheck: true,
+        rateLimit: { ratePerSec: 30, burst: 50 },
+      },
+      {
+        id: 'n-s2-safe',
+        roles: ['normal'],
+        ledgerIndex: 92450102,
+        strictLedgerCheck: true,
+        rateLimit: { ratePerSec: 30, burst: 15 },
+      },
+    ],
+    {
+      cache: { enabled: false },
+      routing: { preferSafeLagForLedgerClosed: true },
+    },
+  );
+
+  try {
+    const client = await connectClient(env.proxyUrl);
+
+    // Seed node heights passively
+    await sendAndWait(client, { id: 's1', command: 'account_info' }); // hits n-fast (105)
+    await sendAndWait(client, { id: 's2', command: 'ledger_closed' }); // hits n-s2-safe (102)
+
+    // Subsequent ledger_closed prefers n-s2-safe (102 <= 105, within maxSafeLedgerLag=15)
+    // even when n-fast has more tokens!
+    const lc = await sendAndWait(client, { id: 'lc-safe', command: 'ledger_closed' });
+    assert.equal(lc.status, 'success');
+    assert.equal(lc._mockNode, 'n-s2-safe');
+    assert.equal(lc.result.ledger_index, 92450102);
+
+    // Client queries account_lines with 92450102 -> succeeds on n-fast too!
+    const al = await sendAndWait(client, {
+      id: 'al-safe',
+      command: 'account_lines',
+      ledger_index: lc.result.ledger_index,
+    });
+    assert.equal(al.status, 'success');
+    assert.equal(al.result.ledger_index, 92450102);
+
+    client.close();
+  } finally {
+    await env.teardown();
+  }
+});
+

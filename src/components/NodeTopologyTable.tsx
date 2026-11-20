@@ -4,17 +4,46 @@ import type { NodeStats } from '../types';
 
 interface NodeTopologyTableProps {
   nodes: NodeStats[];
+  maxValidatedSeq?: number | null;
+  maxSafeLedgerLag?: number;
   readOnly?: boolean;
   onActionComplete?: () => void;
 }
 
 export function NodeTopologyTable({
   nodes,
+  maxValidatedSeq: maxValidatedSeqProp,
+  maxSafeLedgerLag = 15,
   readOnly = false,
   onActionComplete,
 }: NodeTopologyTableProps) {
   const [busyNode, setBusyNode] = useState<string | null>(null);
+  const [probingLedgers, setProbingLedgers] = useState<boolean>(false);
   const [actionError, setActionError] = useState<string | null>(null);
+
+  const computedMaxSeq = nodes.reduce<number | null>((max, n) => {
+    if (typeof n.lastValidatedSeq !== 'number') return max;
+    return max === null || n.lastValidatedSeq > max ? n.lastValidatedSeq : max;
+  }, null);
+  const maxValidatedSeq =
+    maxValidatedSeqProp !== undefined ? maxValidatedSeqProp : computedMaxSeq;
+
+  const probeLedgers = async () => {
+    setProbingLedgers(true);
+    setActionError(null);
+    try {
+      const res = await fetch('/api/nodes/probe-ledger', { method: 'POST' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Probe failed (${res.status})`);
+      }
+      onActionComplete?.();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Ledger probe failed');
+    } finally {
+      setProbingLedgers(false);
+    }
+  };
 
   const runNodeAction = async (
     nodeId: string,
@@ -87,9 +116,23 @@ export function NodeTopologyTable({
             Role capabilities, stateful slot allocation, weighted token buckets, and failover state
           </p>
         </div>
-        {actionError && (
-          <div className="text-xs text-red-700 font-medium">{actionError}</div>
-        )}
+        <div className="flex items-center gap-3 shrink-0">
+          {actionError && (
+            <div className="text-xs text-red-700 font-medium">{actionError}</div>
+          )}
+          {!readOnly && (
+            <button
+              type="button"
+              disabled={probingLedgers}
+              onClick={() => void probeLedgers()}
+              title="Query server_info across online upstream pools to refresh validated ledger heights"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40"
+            >
+              <RefreshCw className={`w-3 h-3 ${probingLedgers ? 'animate-spin' : ''}`} />
+              <span>{probingLedgers ? 'Probing...' : 'Probe Ledgers'}</span>
+            </button>
+          )}
+        </div>
       </div>
 
       {nodes.length === 0 ? (
@@ -104,6 +147,7 @@ export function NodeTopologyTable({
                 <th className="py-3 px-4 whitespace-nowrap">Node / Endpoint</th>
                 <th className="py-3 px-4 whitespace-nowrap">Roles</th>
                 <th className="py-3 px-4 whitespace-nowrap">Circuit Status</th>
+                <th className="py-3 px-4 whitespace-nowrap text-right">Ledger Height</th>
                 <th className="py-3 px-4 whitespace-nowrap text-right">Pool WS</th>
                 <th className="py-3 px-4 whitespace-nowrap text-right">Path Slots</th>
                 <th className="py-3 px-4 whitespace-nowrap text-right">Sub Slots</th>
@@ -141,6 +185,51 @@ export function NodeTopologyTable({
                         <div className="text-[11px] font-mono text-amber-700 mt-0.5 whitespace-nowrap">
                           Backpressure {node.rateMultiplier}x
                         </div>
+                      )}
+                      {(node.currentRejectedCooldownSec ?? 0) > 0 && (
+                        <div className="text-[11px] font-mono text-amber-700 mt-0.5 whitespace-nowrap tabular-nums">
+                          Clio no-current ({node.currentRejectedCooldownSec}s)
+                        </div>
+                      )}
+                    </td>
+
+                    <td className="py-3 px-4 align-middle text-right font-mono tabular-nums text-xs whitespace-nowrap">
+                      {typeof node.lastValidatedSeq === 'number' ? (
+                        <>
+                          <div className="text-slate-900 font-medium">
+                            #{node.lastValidatedSeq}
+                          </div>
+                          <div className="text-[11px] mt-0.5">
+                            {(() => {
+                              const lag =
+                                maxValidatedSeq !== null
+                                  ? Math.max(0, maxValidatedSeq - node.lastValidatedSeq)
+                                  : null;
+                              const lagLabel =
+                                lag === null
+                                  ? null
+                                  : lag === 0
+                                    ? { text: 'Synced', cls: 'text-emerald-700' }
+                                    : lag <= maxSafeLedgerLag
+                                      ? { text: `-${lag} safe`, cls: 'text-slate-500' }
+                                      : { text: `-${lag} lag`, cls: 'text-amber-700' };
+                              return (
+                                <>
+                                  {lagLabel && (
+                                    <span className={lagLabel.cls}>{lagLabel.text}</span>
+                                  )}
+                                  {node.clioVersion && (
+                                    <span className="text-slate-400">
+                                      {lagLabel ? ' · ' : ''}Clio
+                                    </span>
+                                  )}
+                                </>
+                              );
+                            })()}
+                          </div>
+                        </>
+                      ) : (
+                        <span className="text-slate-400">—</span>
                       )}
                     </td>
 

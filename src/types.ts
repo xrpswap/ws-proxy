@@ -25,6 +25,10 @@ export interface NodeStats {
   totalErrors: number;
   qps: number;
   lastLoadWarningAt: number | null;
+  lastValidatedSeq?: number | null;
+  lastValidatedAt?: number | null;
+  clioVersion?: string | null;
+  currentRejectedCooldownSec?: number;
 }
 
 export interface ProxyStats {
@@ -36,6 +40,10 @@ export interface ProxyStats {
   pendingRequests: number;
   nextProxyId: number;
   rateQueueLength: number;
+  maxValidatedSeq?: number | null;
+  minValidatedSeq?: number | null;
+  safeValidatedSeq?: number | null;
+  sampledLedgerNodes?: number;
   mockMode?: boolean;
   cache: {
     enabled: boolean;
@@ -54,6 +62,7 @@ export interface ProxyStats {
     submitCommands: string[];
     statefulCommands: string[];
     routeExplicitLedgerToHistory: boolean;
+    preferSafeLagForLedgerClosed?: boolean;
     defaultWeight: number;
     commandWeights: Record<string, number>;
   };
@@ -68,6 +77,9 @@ export interface ProxyStats {
     upstreamPingIntervalMs: number;
     reconnectBaseDelayMs: number;
     reconnectMaxDelayMs: number;
+    clioCooldownMs?: number;
+    ledgerRetryMaxAttempts?: number;
+    maxSafeLedgerLag?: number;
   };
   server: {
     host: string;

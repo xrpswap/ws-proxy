@@ -246,18 +246,10 @@ export class ProxyServer {
       let response;
       if (routeInfo.isCacheable) {
         response = await this.cache.getOrFetch(payload, () =>
-          this.nodeManager.sendStatelessRequest(
-            payload,
-            routeInfo.role,
-            routeInfo.weight,
-          ),
+          this.nodeManager.sendStatelessRequest(payload, routeInfo),
         );
       } else {
-        response = await this.nodeManager.sendStatelessRequest(
-          payload,
-          routeInfo.role,
-          routeInfo.weight,
-        );
+        response = await this.nodeManager.sendStatelessRequest(payload, routeInfo);
       }
       sendWsJson(session.ws, response);
     } catch (err) {
@@ -333,6 +325,10 @@ export class ProxyServer {
       pendingRequests: nodeStats.pendingRequests,
       nextProxyId: nodeStats.nextProxyId,
       rateQueueLength: nodeStats.rateQueueLength,
+      maxValidatedSeq: nodeStats.maxValidatedSeq,
+      minValidatedSeq: nodeStats.minValidatedSeq,
+      safeValidatedSeq: nodeStats.safeValidatedSeq,
+      sampledLedgerNodes: nodeStats.sampledLedgerNodes,
       cache: cacheStats,
       nodes: nodeStats.nodes,
       routing: {
@@ -341,6 +337,7 @@ export class ProxyServer {
         submitCommands: this.config.routing.submitCommands,
         statefulCommands: this.config.routing.statefulCommands,
         routeExplicitLedgerToHistory: this.config.routing.routeExplicitLedgerToHistory,
+        preferSafeLagForLedgerClosed: this.config.routing.preferSafeLagForLedgerClosed,
         defaultWeight: this.config.routing.defaultWeight,
         commandWeights: this.config.routing.commandWeights,
       },
