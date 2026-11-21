@@ -147,7 +147,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 0,
       maxSubscribeConns: 5,
-      rateLimit: { ratePerSec: 5, burst: 25 },
+      rateLimit: { ratePerSec: 5, burst: 24 },
     },
     {
       id: 'honeycluster',

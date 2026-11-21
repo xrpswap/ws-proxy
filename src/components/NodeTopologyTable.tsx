@@ -1,11 +1,14 @@
 import { AlertTriangle, CheckCircle2, PauseCircle, Power, RefreshCw, ShieldAlert, Zap } from 'lucide-react';
 import { useState } from 'react';
-import type { NodeStats } from '../types';
+import type { NodeStats, ProxyStats } from '../types';
 
 interface NodeTopologyTableProps {
   nodes: NodeStats[];
   maxValidatedSeq?: number | null;
   maxSafeLedgerLag?: number;
+  totalRetries?: number;
+  blacklistBypassed?: number;
+  lastRetry?: ProxyStats['lastRetry'];
   readOnly?: boolean;
   onActionComplete?: () => void;
 }
@@ -14,6 +17,9 @@ export function NodeTopologyTable({
   nodes,
   maxValidatedSeq: maxValidatedSeqProp,
   maxSafeLedgerLag = 15,
+  totalRetries = 0,
+  blacklistBypassed = 0,
+  lastRetry = null,
   readOnly = false,
   onActionComplete,
 }: NodeTopologyTableProps) {
@@ -116,10 +122,28 @@ export function NodeTopologyTable({
             Role capabilities, stateful slot allocation, weighted token buckets, and failover state
           </p>
         </div>
-        <div className="flex items-center gap-3 shrink-0">
+        <div className="flex flex-wrap items-center gap-4 shrink-0">
           {actionError && (
             <div className="text-xs text-red-700 font-medium">{actionError}</div>
           )}
+          <div className="text-xs font-mono tabular-nums text-slate-600 whitespace-nowrap">
+            Failover retries:{' '}
+            <span className={totalRetries > 0 ? 'text-slate-900 font-semibold' : 'text-slate-500'}>
+              {totalRetries}
+            </span>
+            {' · '}BL skipped:{' '}
+            <span
+              className={blacklistBypassed > 0 ? 'text-slate-900 font-semibold' : 'text-slate-500'}
+            >
+              {blacklistBypassed}
+            </span>
+            {lastRetry && (
+              <span className="text-slate-500">
+                {' '}
+                ({lastRetry.reason}: {lastRetry.fromNodeId} → {lastRetry.toNodeId})
+              </span>
+            )}
+          </div>
           {!readOnly && (
             <button
               type="button"

@@ -163,6 +163,9 @@ export default function App() {
             nodes={stats?.nodes ?? []}
             maxValidatedSeq={stats?.maxValidatedSeq}
             maxSafeLedgerLag={stats?.limits?.maxSafeLedgerLag}
+            totalRetries={stats?.totalRetries}
+            blacklistBypassed={stats?.blacklistBypassed}
+            lastRetry={stats?.lastRetry}
             readOnly
           />
         </main>
@@ -315,6 +318,9 @@ export default function App() {
                 nodes={stats?.nodes ?? []}
                 maxValidatedSeq={stats?.maxValidatedSeq}
                 maxSafeLedgerLag={stats?.limits?.maxSafeLedgerLag}
+                totalRetries={stats?.totalRetries}
+                blacklistBypassed={stats?.blacklistBypassed}
+                lastRetry={stats?.lastRetry}
                 onActionComplete={() => void fetchStats()}
               />
             </>
