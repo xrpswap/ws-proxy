@@ -1203,5 +1203,62 @@ test('25. Permanent blacklist cache (ttl=0) and multi-node chain failover (3 bla
   }
 });
 
+test('26. Upstream tooBusy/slowDown error retries transparently on healthy peer and applies backpressure', async () => {
+  const env = await setupCluster(
+    [
+      {
+        id: 'n-busy-clio',
+        roles: ['normal'],
+        clioMode: true,
+        rateLimit: { ratePerSec: 20, burst: 50 },
+      },
+      {
+        id: 'n-healthy',
+        roles: ['normal'],
+        rateLimit: { ratePerSec: 20, burst: 20 },
+      },
+    ],
+    {
+      limits: {
+        circuitBreakerThreshold: 3,
+        slowDownRecoveryMs: 5000,
+      },
+    },
+  );
+
+  try {
+    const client = await connectClient(env.proxyUrl);
+    env.mocks['n-busy-clio'].armLoadError('tooBusy');
+
+    const res = await sendAndWait(client, {
+      id: 1131,
+      command: 'account_info',
+      account: 'rBQkEKFMnBjc19DRaY7ThLJ2woqQManbTt',
+      ledger_index: 92450050,
+    });
+
+    assert.equal(res.status, 'success');
+    assert.equal(res.id, 1131);
+    assert.equal(res._mockNode, 'n-healthy');
+
+    const stats = env.proxy.getStats();
+    assert.equal(stats.totalRetries, 1);
+    assert.equal(stats.lastRetry?.reason, 'tooBusy');
+    assert.equal(stats.lastRetry?.fromNodeId, 'n-busy-clio');
+    assert.equal(stats.lastRetry?.toNodeId, 'n-healthy');
+
+    const busyStats = stats.nodes.find((n) => n.id === 'n-busy-clio');
+    assert.equal(busyStats.isSlowedDown, true);
+    assert.equal(busyStats.rateMultiplier, 0.5);
+    assert.equal(busyStats.consecutiveFailures, 1);
+    assert.equal(busyStats.retriedOut, 1);
+
+    client.close();
+  } finally {
+    await env.teardown();
+  }
+});
+
+
 
 

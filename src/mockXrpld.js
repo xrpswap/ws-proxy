@@ -34,6 +34,7 @@ export class MockXrpldNode {
     this.port = 0;
     this.online = false;
     this.loadWarningArmed = false;
+    this.loadErrorArmed = null;
     this.receivedCommands = [];
     this.activeConnections = new Set();
     this.streamTimers = new Map();
@@ -110,6 +111,10 @@ export class MockXrpldNode {
     this.loadWarningArmed = true;
   }
 
+  armLoadError(errorCode = 'tooBusy') {
+    this.loadErrorArmed = errorCode;
+  }
+
   buildLedgerEvent(seq = this.ledgerIndex) {
     return {
       type: 'ledgerClosed',
@@ -147,6 +152,34 @@ export class MockXrpldNode {
 
     if (req.id !== undefined && req.id !== null) {
       response.id = req.id;
+    }
+
+    if (this.loadErrorArmed) {
+      const errorCode = this.loadErrorArmed;
+      this.loadErrorArmed = null;
+      const busyErr = {
+        status: 'error',
+        type: 'response',
+        error: errorCode,
+        error_code: errorCode === 'tooBusy' ? 9 : 10,
+        error_message: 'The server is too busy to help you now.',
+        request: req,
+        ...(this.clioMode
+          ? {
+              warnings: [
+                {
+                  id: 2001,
+                  message:
+                    "This is a clio server. clio only serves validated data. If you want to talk to rippled, include 'ledger_index':'current' in your request",
+                },
+              ],
+            }
+          : {}),
+        _mockNode: this.id,
+      };
+      if (req.id !== undefined && req.id !== null) busyErr.id = req.id;
+      if (ws.readyState === 1) ws.send(JSON.stringify(busyErr));
+      return;
     }
 
     if (this.loadWarningArmed) {

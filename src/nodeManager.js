@@ -27,6 +27,14 @@ function isLedgerNotFoundError(msg) {
   );
 }
 
+function isUpstreamLoadRejection(msg) {
+  return Boolean(
+    msg &&
+      msg.status === 'error' &&
+      ['tooBusy', 'slowDown', 'highLoad'].includes(msg.error),
+  );
+}
+
 class UpstreamPoolConnection {
   constructor(node, index, manager) {
     this.node = node;
@@ -1090,6 +1098,21 @@ export class NodeManager {
           node.retriedOut += 1;
           this.totalRetries += 1;
           pendingRetrySource = { node, reason: 'lgrNotFound' };
+          continue;
+        }
+        return response;
+      }
+
+      if (isUpstreamLoadRejection(response)) {
+        excludedNodeIds.add(node.id);
+        const { healthyConnected } = this.getEligibleStatelessNodes(
+          routeInfo.role,
+          excludedNodeIds,
+        );
+        if (healthyConnected.length > 0 && attempt + 1 < ledgerMaxAttempts) {
+          node.retriedOut += 1;
+          this.totalRetries += 1;
+          pendingRetrySource = { node, reason: response.error };
           continue;
         }
         return response;
