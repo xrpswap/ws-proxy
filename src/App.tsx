@@ -1,4 +1,4 @@
-import { Activity, ArrowRight, Network, RefreshCw, Sliders, Terminal } from 'lucide-react';
+import { Activity, Network, RefreshCw, Sliders, Terminal } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { KpiStrip } from './components/KpiStrip';
 import { NodeTopologyTable } from './components/NodeTopologyTable';
@@ -78,7 +78,7 @@ export default function App() {
               xrpld-ws-proxy
             </a>
 
-            <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600">
+            <nav className="flex items-center gap-6 text-sm font-medium text-slate-600">
               <a
                 href="/"
                 onClick={(e) => {
@@ -89,51 +89,7 @@ export default function App() {
               >
                 Overview
               </a>
-              <a
-                href="/proxy-dashboard"
-                onClick={(e) => {
-                  e.preventDefault();
-                  setActiveTab('topology');
-                  navigate('dashboard');
-                }}
-                className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
-              >
-                Node Topology
-              </a>
-              <a
-                href="/proxy-dashboard"
-                onClick={(e) => {
-                  e.preventDefault();
-                  setActiveTab('workbench');
-                  navigate('dashboard');
-                }}
-                className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
-              >
-                WS Workbench
-              </a>
-              <a
-                href="/proxy-dashboard"
-                onClick={(e) => {
-                  e.preventDefault();
-                  setActiveTab('routing');
-                  navigate('dashboard');
-                }}
-                className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
-              >
-                Routing Rules
-              </a>
             </nav>
-
-            <div className="shrink-0">
-              <button
-                type="button"
-                onClick={() => navigate('dashboard')}
-                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                <span>Control Console</span>
-                <ArrowRight className="w-3.5 h-3.5" />
-              </button>
-            </div>
           </div>
         </header>
 
