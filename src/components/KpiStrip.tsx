@@ -97,8 +97,12 @@ export function KpiStrip({ stats, loading }: KpiStripProps) {
           <span className="text-lg font-semibold text-slate-700">{rateQueueLength}</span>
           <span className="text-xs text-slate-400">queued</span>
         </div>
-        <div className="mt-1.5 text-xs text-slate-500 font-mono tabular-nums">
-          Next Proxy ID #{stats?.nextProxyId ?? 1}
+        <div className="mt-1.5 text-xs text-slate-500 font-mono tabular-nums truncate">
+          {(stats?.totalRetries ?? 0) > 0 || (stats?.blacklistBypassed ?? 0) > 0
+            ? stats?.lastRetry
+              ? `${stats.totalRetries ?? 0} retries (${stats.blacklistBypassed ?? 0} skipped) · ${stats.lastRetry.fromNodeId}→${stats.lastRetry.toNodeId}`
+              : `${stats?.totalRetries ?? 0} retries · ${stats?.blacklistBypassed ?? 0} BL skipped`
+            : `Next Proxy ID #${stats?.nextProxyId ?? 1} · 0 retries`}
         </div>
       </div>
 

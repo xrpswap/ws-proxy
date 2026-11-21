@@ -66,6 +66,7 @@ export function classifyRequest(payload, routingConfig, cacheConfig) {
     command,
     role,
     isStateful,
+    isSubmit: role === 'submit',
     statefulKind,
     weight,
     isCacheable,

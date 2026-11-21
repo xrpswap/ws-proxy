@@ -39,6 +39,13 @@ export function RoutingConfigView({ stats }: RoutingConfigViewProps) {
     { label: 'Clio No-Current Cooldown', value: `${stats.limits.clioCooldownMs ?? 120000} ms` },
     { label: 'Cross-Node Ledger Retries', value: `${stats.limits.ledgerRetryMaxAttempts ?? 2} attempts` },
     {
+      label: 'Submit Blacklist Cache',
+      value:
+        (stats.limits.blacklistCacheTtlMs ?? 0) <= 0
+          ? `Permanent · max ${stats.limits.blacklistCacheMaxEntries ?? 1000}`
+          : `${Math.round((stats.limits.blacklistCacheTtlMs ?? 0) / 60000)}m TTL · max ${stats.limits.blacklistCacheMaxEntries ?? 1000}`,
+    },
+    {
       label: 'Upstream Ledger Stream',
       value: stats.ledgerStream?.enabled ? 'Enabled' : 'Disabled',
     },

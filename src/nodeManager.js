@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 import { applyResponseId, extractRequestId } from './errors.js';
 import { BoundedRateQueue, TokenBucket } from './rateLimiter.js';
+import { extractBlacklistRejection, payloadMatchesBlacklistedTargets } from './xrplCodec.js';
 
 function createProxyError(code, message) {
   const err = new Error(message);
@@ -338,6 +339,10 @@ export class NodeRuntime {
     this.clioVersion = null;
     this.currentRejectedUntil = 0;
     this.ledgerStreamSupported = true;
+    this.blacklistedTargets = new Map();
+    this.retriedOut = 0;
+    this.blacklistRejections = 0;
+    this.blacklistBypassed = 0;
   }
 
   onPoolConnected() {
@@ -352,6 +357,48 @@ export class NodeRuntime {
 
   markCurrentRejected(cooldownMs = this.limits.clioCooldownMs ?? 120000) {
     this.currentRejectedUntil = Date.now() + cooldownMs;
+  }
+
+  pruneExpiredBlacklistedTargets(now = Date.now()) {
+    for (const [classic, entry] of this.blacklistedTargets.entries()) {
+      if (entry.expiresAt !== null && entry.expiresAt <= now) {
+        this.blacklistedTargets.delete(classic);
+      }
+    }
+  }
+
+  recordBlacklistedAddresses(addresses, now = Date.now()) {
+    if (!Array.isArray(addresses) || addresses.length === 0) return;
+    this.pruneExpiredBlacklistedTargets(now);
+    const rawTtl = this.limits.blacklistCacheTtlMs;
+    const ttlMs = rawTtl === undefined || rawTtl === null ? 0 : rawTtl;
+    const maxEntries = Math.max(1, this.limits.blacklistCacheMaxEntries ?? 1000);
+    const expiresAt = ttlMs > 0 ? now + ttlMs : null;
+
+    for (const item of addresses) {
+      if (!item || !item.classic || !item.accountIdHex) continue;
+      if (this.blacklistedTargets.has(item.classic)) {
+        this.blacklistedTargets.delete(item.classic);
+      }
+      this.blacklistedTargets.set(item.classic, {
+        classic: item.classic,
+        accountIdHex: item.accountIdHex,
+        expiresAt,
+      });
+    }
+
+    while (this.blacklistedTargets.size > maxEntries) {
+      const oldestKey = this.blacklistedTargets.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.blacklistedTargets.delete(oldestKey);
+    }
+  }
+
+  hasAnyBlacklistedTarget(payload, now = Date.now()) {
+    if (this.blacklistedTargets.size === 0 || !payload) return false;
+    this.pruneExpiredBlacklistedTargets(now);
+    if (this.blacklistedTargets.size === 0) return false;
+    return payloadMatchesBlacklistedTargets(payload, this.blacklistedTargets);
   }
 
   extractLedgerSnapshot(obj) {
@@ -610,6 +657,7 @@ export class NodeRuntime {
   }
 
   getStats(now = Date.now()) {
+    this.pruneExpiredBlacklistedTargets(now);
     const activePoolConns = this.getActivePoolCount();
     const cooldownRemainingSec =
       this.circuitState === 'OPEN' && this.cooldownUntil
@@ -647,6 +695,10 @@ export class NodeRuntime {
         this.currentRejectedUntil > now
           ? Math.ceil((this.currentRejectedUntil - now) / 1000)
           : 0,
+      blacklistedCount: this.blacklistedTargets.size,
+      retriedOut: this.retriedOut,
+      blacklistRejections: this.blacklistRejections,
+      blacklistBypassed: this.blacklistBypassed,
     };
   }
 
@@ -655,6 +707,7 @@ export class NodeRuntime {
       clearTimeout(this.cooldownTimer);
       this.cooldownTimer = null;
     }
+    this.blacklistedTargets.clear();
     this.bucket.destroy();
     for (const conn of this.pool) {
       conn.destroy();
@@ -683,6 +736,10 @@ export class NodeManager {
     this.pendingLedgerSubWaiters = [];
     this.streamSettleDeadline = 0;
     this.streamSettleTimer = null;
+    this.totalRetries = 0;
+    this.blacklistRetries = 0;
+    this.blacklistBypassed = 0;
+    this.lastRetry = null;
   }
 
   isLedgerStreamEnabled() {
@@ -747,6 +804,7 @@ export class NodeManager {
       requestedLedgerIndex = null,
       requiresCurrent = false,
       preferSafeLag = false,
+      submitPayload = null,
     } = options;
 
     const { roleNodes, healthyConnected } = this.getEligibleStatelessNodes(
@@ -767,6 +825,23 @@ export class NodeManager {
       const nonClio = candidates.filter((n) => !n.isCurrentRejected(now));
       if (nonClio.length > 0) {
         candidates = nonClio;
+      }
+    }
+
+    let skippedBlacklistNodes = [];
+    if (submitPayload) {
+      const filteredOut = [];
+      const nonBlacklisted = [];
+      for (const n of candidates) {
+        if (n.hasAnyBlacklistedTarget(submitPayload, now)) {
+          filteredOut.push(n);
+        } else {
+          nonBlacklisted.push(n);
+        }
+      }
+      if (nonBlacklisted.length > 0) {
+        candidates = nonBlacklisted;
+        skippedBlacklistNodes = filteredOut;
       }
     }
 
@@ -826,6 +901,12 @@ export class NodeManager {
           if (node.circuitState === 'HALF_OPEN') {
             node.halfOpenInFlight = true;
           }
+          if (skippedBlacklistNodes.length > 0) {
+            this.blacklistBypassed += 1;
+            for (const skipped of skippedBlacklistNodes) {
+              skipped.blacklistBypassed += 1;
+            }
+          }
           return { node, conn };
         }
       }
@@ -851,6 +932,7 @@ export class NodeManager {
       requestedLedgerIndex: routeInfo.requestedLedgerIndex,
       requiresCurrent: routeInfo.requiresCurrent,
       preferSafeLag: routeInfo.preferSafeLag,
+      submitPayload: routeInfo.isSubmit ? payload : null,
     });
 
     node.recordRequestStart();
@@ -912,6 +994,7 @@ export class NodeManager {
       typeof roleOrRouteInfo === 'string'
         ? {
             role: roleOrRouteInfo,
+            isSubmit: roleOrRouteInfo === 'submit',
             weight: weightArg ?? 2,
             requestedLedgerIndex: null,
             requiresCurrent: false,
@@ -919,9 +1002,14 @@ export class NodeManager {
           }
         : roleOrRouteInfo;
 
-    const maxAttempts = 1 + (this.limits.ledgerRetryMaxAttempts ?? 2);
+    const ledgerMaxAttempts = 1 + (this.limits.ledgerRetryMaxAttempts ?? 2);
+    const roleNodeCount = this.nodes.filter((n) => n.hasRole(routeInfo.role)).length;
+    const maxAttempts = routeInfo.isSubmit
+      ? Math.max(ledgerMaxAttempts, roleNodeCount)
+      : ledgerMaxAttempts;
     const excludedNodeIds = new Set();
     let lastResponse = null;
+    let pendingRetrySource = null;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       let attemptResult;
@@ -941,6 +1029,38 @@ export class NodeManager {
       const { node, response } = attemptResult;
       lastResponse = response;
 
+      if (pendingRetrySource) {
+        this.lastRetry = {
+          at: Date.now(),
+          reason: pendingRetrySource.reason,
+          fromNodeId: pendingRetrySource.node.id,
+          toNodeId: node.id,
+          status: response?.status ?? 'unknown',
+        };
+        pendingRetrySource = null;
+      }
+
+      if (routeInfo.isSubmit && response?.status === 'error') {
+        const { isBlacklistError, addresses } = extractBlacklistRejection(response);
+        if (isBlacklistError) {
+          node.recordBlacklistedAddresses(addresses);
+          node.blacklistRejections += 1;
+          excludedNodeIds.add(node.id);
+          const { healthyConnected } = this.getEligibleStatelessNodes(
+            routeInfo.role,
+            excludedNodeIds,
+          );
+          if (healthyConnected.length > 0 && attempt + 1 < maxAttempts) {
+            node.retriedOut += 1;
+            this.totalRetries += 1;
+            this.blacklistRetries += 1;
+            pendingRetrySource = { node, reason: 'blacklist' };
+            continue;
+          }
+          return response;
+        }
+      }
+
       if (isClioCurrentRejection(response)) {
         node.markCurrentRejected(this.limits.clioCooldownMs);
         excludedNodeIds.add(node.id);
@@ -948,7 +1068,10 @@ export class NodeManager {
           routeInfo.role,
           excludedNodeIds,
         );
-        if (healthyConnected.length > 0 && attempt + 1 < maxAttempts) {
+        if (healthyConnected.length > 0 && attempt + 1 < ledgerMaxAttempts) {
+          node.retriedOut += 1;
+          this.totalRetries += 1;
+          pendingRetrySource = { node, reason: 'clioNoCurrent' };
           continue;
         }
         return response;
@@ -960,7 +1083,10 @@ export class NodeManager {
           routeInfo.role,
           excludedNodeIds,
         );
-        if (healthyConnected.length > 0 && attempt + 1 < maxAttempts) {
+        if (healthyConnected.length > 0 && attempt + 1 < ledgerMaxAttempts) {
+          node.retriedOut += 1;
+          this.totalRetries += 1;
+          pendingRetrySource = { node, reason: 'lgrNotFound' };
           continue;
         }
         return response;
@@ -1458,6 +1584,10 @@ export class NodeManager {
       safeBroadcastSeq: this.lastBroadcastSeq > 0 ? this.lastBroadcastSeq : safeValidatedSeq,
       sampledLedgerNodes,
       snapshotCacheSize: this.ledgerSnapshots.size,
+      totalRetries: this.totalRetries,
+      blacklistRetries: this.blacklistRetries,
+      blacklistBypassed: this.blacklistBypassed,
+      lastRetry: this.lastRetry,
       nodes,
     };
   }

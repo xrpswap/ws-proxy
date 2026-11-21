@@ -29,6 +29,10 @@ export interface NodeStats {
   lastValidatedAt?: number | null;
   clioVersion?: string | null;
   currentRejectedCooldownSec?: number;
+  blacklistedCount?: number;
+  retriedOut?: number;
+  blacklistRejections?: number;
+  blacklistBypassed?: number;
 }
 
 export interface ProxyStats {
@@ -47,6 +51,16 @@ export interface ProxyStats {
   safeBroadcastSeq?: number | null;
   sampledLedgerNodes?: number;
   snapshotCacheSize?: number;
+  totalRetries?: number;
+  blacklistRetries?: number;
+  blacklistBypassed?: number;
+  lastRetry?: {
+    at: number;
+    reason: string;
+    fromNodeId: string;
+    toNodeId: string;
+    status: string;
+  } | null;
   mockMode?: boolean;
   cache: {
     enabled: boolean;
@@ -93,6 +107,8 @@ export interface ProxyStats {
     clioCooldownMs?: number;
     ledgerRetryMaxAttempts?: number;
     maxSafeLedgerLag?: number;
+    blacklistCacheTtlMs?: number;
+    blacklistCacheMaxEntries?: number;
   };
   server: {
     host: string;

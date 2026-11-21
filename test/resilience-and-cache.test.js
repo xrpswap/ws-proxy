@@ -4,6 +4,10 @@ import WebSocket from 'ws';
 import { createConfig } from '../src/config.js';
 import { MockXrpldNode } from '../src/mockXrpld.js';
 import { ProxyServer } from '../src/proxyServer.js';
+import {
+  decodeXrplClassicAddressToHex,
+  encodeXrplAccountIdHexToClassic,
+} from '../src/xrplCodec.js';
 
 function connectClient(url) {
   return new Promise((resolve, reject) => {
@@ -45,6 +49,8 @@ async function setupCluster(nodeSpecs, overrides = {}) {
       clioMode: spec.clioMode,
       strictLedgerCheck: spec.strictLedgerCheck,
       rejectSubscribe: spec.rejectSubscribe,
+      blacklistedAddresses: spec.blacklistedAddresses,
+      submitResponder: spec.submitResponder,
     });
     const wsUrl = await mock.start(0);
     mocks[spec.id] = mock;
@@ -859,4 +865,323 @@ test('22. Half-open dead upstream connection (missed pongs) is terminated, recon
     await new Promise((r) => srv.close(() => r()));
   }
 });
+
+test('23. Xaman Blacklist submit rejection retries on healthy peer, caches flagged AccountID, and never retries status=success', async () => {
+  const flaggedAddr = 'rN1bCPAxHDvyJzvkUso1L2wvXufgE4gXPL';
+  const flaggedHex = decodeXrplClassicAddressToHex(flaggedAddr);
+  assert.ok(flaggedHex && flaggedHex.length === 40);
+  assert.equal(encodeXrplAccountIdHexToClassic(flaggedHex), flaggedAddr);
+
+  const cleanAddr = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
+  const cleanHex = decodeXrplClassicAddressToHex(cleanAddr);
+  assert.ok(cleanHex && cleanHex.length === 40);
+
+  let forceSuccessWithBlacklistedText = false;
+
+  const env = await setupCluster(
+    [
+      {
+        id: 'n-xrplcluster-bl',
+        roles: ['submit'],
+        rateLimit: { ratePerSec: 100, burst: 100 },
+        blacklistedAddresses: [flaggedAddr],
+        submitResponder: (req, nodeId) => {
+          if (forceSuccessWithBlacklistedText) {
+            return {
+              status: 'success',
+              type: 'response',
+              result: {
+                engine_result: 'tecPATH_DRY',
+                engine_result_code: 128,
+                engine_result_message: `Path could not send partial amount (Xaman Blacklist note for ${flaggedAddr})`,
+                tx_json: { TransactionType: 'Payment', hash: 'ABCDEF' },
+              },
+              _mockNode: nodeId,
+            };
+          }
+          return null;
+        },
+      },
+      {
+        id: 'n-s1',
+        roles: ['submit'],
+        rateLimit: { ratePerSec: 10, burst: 10 },
+      },
+    ],
+    {
+      limits: {
+        circuitBreakerThreshold: 1,
+        blacklistCacheTtlMs: 60000,
+        blacklistCacheMaxEntries: 50,
+      },
+    },
+  );
+
+  try {
+    const client = await connectClient(env.proxyUrl);
+
+    // Byte-aligned Payment tx_blob embedding flagged 20-byte AccountID
+    const flaggedBlob = `1200002280000000240000000161400000000000000A8314${flaggedHex}732102AABBCC`;
+    const cleanBlob = `1200002280000000240000000261400000000000000A8314${cleanHex}732102AABBCC`;
+
+    // 1. First submit hits n-xrplcluster-bl (higher tokens), gets blacklist error, transparently retries to n-s1
+    const r1 = await sendAndWait(client, {
+      id: 'sub-bl-1',
+      command: 'submit',
+      tx_blob: flaggedBlob,
+    });
+    assert.equal(r1.status, 'success');
+    assert.equal(r1._mockNode, 'n-s1');
+
+    const hitsAfterFirst = env.mocks['n-xrplcluster-bl'].receivedCommands.filter(
+      (c) => c.command === 'submit',
+    ).length;
+    assert.equal(hitsAfterFirst, 1);
+
+    const statsAfterFirst = env.proxy.getStats();
+    const blNodeStats = statsAfterFirst.nodes.find((n) => n.id === 'n-xrplcluster-bl');
+    assert.equal(blNodeStats.circuitState, 'CLOSED');
+    assert.equal(blNodeStats.consecutiveFailures, 0);
+    assert.equal(blNodeStats.blacklistedCount, 1);
+    assert.equal(blNodeStats.blacklistRejections, 1);
+    assert.equal(blNodeStats.retriedOut, 1);
+    assert.equal(statsAfterFirst.totalRetries, 1);
+    assert.equal(statsAfterFirst.blacklistRetries, 1);
+    assert.equal(statsAfterFirst.lastRetry?.fromNodeId, 'n-xrplcluster-bl');
+    assert.equal(statsAfterFirst.lastRetry?.toNodeId, 'n-s1');
+    assert.equal(statsAfterFirst.lastRetry?.reason, 'blacklist');
+
+    // 2. Second submit with same flagged tx_blob skips n-xrplcluster-bl entirely (0 extra hits)
+    const r2 = await sendAndWait(client, {
+      id: 'sub-bl-2',
+      command: 'submit',
+      tx_blob: flaggedBlob,
+    });
+    assert.equal(r2.status, 'success');
+    assert.equal(r2._mockNode, 'n-s1');
+    const hitsAfterSecond = env.mocks['n-xrplcluster-bl'].receivedCommands.filter(
+      (c) => c.command === 'submit',
+    ).length;
+    assert.equal(hitsAfterSecond, 1);
+
+    const statsAfterSecond = env.proxy.getStats();
+    assert.equal(statsAfterSecond.blacklistBypassed, 1);
+    assert.equal(
+      statsAfterSecond.nodes.find((n) => n.id === 'n-xrplcluster-bl').blacklistBypassed,
+      1,
+    );
+
+    // 3. Normal non-blacklisted tx_blob continues using n-xrplcluster-bl
+    const rClean = await sendAndWait(client, {
+      id: 'sub-clean-1',
+      command: 'submit',
+      tx_blob: cleanBlob,
+    });
+    assert.equal(rClean.status, 'success');
+    assert.equal(rClean._mockNode, 'n-xrplcluster-bl');
+
+    // 4. status === 'success' (even tec* mentioning blacklist words) MUST NEVER retry
+    forceSuccessWithBlacklistedText = true;
+    const s1HitsBefore = env.mocks['n-s1'].receivedCommands.filter(
+      (c) => c.command === 'submit',
+    ).length;
+    const rTec = await sendAndWait(client, {
+      id: 'sub-tec-1',
+      command: 'submit',
+      tx_blob: cleanBlob,
+    });
+    assert.equal(rTec.status, 'success');
+    assert.equal(rTec.result.engine_result, 'tecPATH_DRY');
+    assert.equal(rTec._mockNode, 'n-xrplcluster-bl');
+    const s1HitsAfter = env.mocks['n-s1'].receivedCommands.filter(
+      (c) => c.command === 'submit',
+    ).length;
+    assert.equal(s1HitsAfter, s1HitsBefore);
+
+    client.close();
+  } finally {
+    await env.teardown();
+  }
+});
+
+test('24. Blacklist negative cache enforces bounded maxEntries eviction and TTL expiration', async () => {
+  const addr1 = encodeXrplAccountIdHexToClassic('11'.repeat(20));
+  const addr2 = encodeXrplAccountIdHexToClassic('22'.repeat(20));
+  const addr3 = encodeXrplAccountIdHexToClassic('33'.repeat(20));
+  assert.ok(addr1 && addr2 && addr3);
+
+  const env = await setupCluster(
+    [
+      {
+        id: 'n-bl-bounded',
+        roles: ['submit'],
+        rateLimit: { ratePerSec: 100, burst: 100 },
+        blacklistedAddresses: [addr1, addr2, addr3],
+      },
+      {
+        id: 'n-clean-peer',
+        roles: ['submit'],
+        rateLimit: { ratePerSec: 10, burst: 10 },
+      },
+    ],
+    {
+      limits: {
+        blacklistCacheMaxEntries: 2,
+        blacklistCacheTtlMs: 120,
+      },
+    },
+  );
+
+  try {
+    const client = await connectClient(env.proxyUrl);
+
+    for (const [idx, addr] of [addr1, addr2, addr3].entries()) {
+      const resp = await sendAndWait(client, {
+        id: `bl-cap-${idx}`,
+        command: 'submit',
+        tx_json: { TransactionType: 'Payment', Destination: addr },
+      });
+      assert.equal(resp.status, 'success');
+      assert.equal(resp._mockNode, 'n-clean-peer');
+    }
+
+    // LRU cap must hold blacklistedCount <= 2 (addr1 evicted when addr3 was inserted)
+    const runtime = env.proxy.nodeManager.getNode('n-bl-bounded');
+    assert.equal(runtime.blacklistedTargets.size, 2);
+    assert.equal(runtime.blacklistedTargets.has(addr1), false);
+    assert.equal(runtime.blacklistedTargets.has(addr2), true);
+    assert.equal(runtime.blacklistedTargets.has(addr3), true);
+
+    // Wait past blacklistCacheTtlMs (120ms) -> cache expires & node re-accepts traffic
+    await new Promise((r) => setTimeout(r, 160));
+    const statsAfterTtl = env.proxy.getStats();
+    const blStats = statsAfterTtl.nodes.find((n) => n.id === 'n-bl-bounded');
+    assert.equal(blStats.blacklistedCount, 0);
+
+    // Next submit with addr2 will hit n-bl-bounded again (then failover to n-clean-peer)
+    const beforeHits = env.mocks['n-bl-bounded'].receivedCommands.filter(
+      (c) => c.command === 'submit',
+    ).length;
+    const afterTtlResp = await sendAndWait(client, {
+      id: 'bl-after-ttl',
+      command: 'submit',
+      tx_json: { TransactionType: 'Payment', Destination: addr2 },
+    });
+    assert.equal(afterTtlResp.status, 'success');
+    const afterHits = env.mocks['n-bl-bounded'].receivedCommands.filter(
+      (c) => c.command === 'submit',
+    ).length;
+    assert.equal(afterHits, beforeHits + 1);
+
+    client.close();
+  } finally {
+    await env.teardown();
+  }
+});
+
+test('25. Permanent blacklist cache (ttl=0) and multi-node chain failover (3 blacklisting submit nodes -> s1/s2/honeycluster)', async () => {
+  const flaggedIssuer = 'rN1bCPAxHDvyJzvkUso1L2wvXufgE4gXPL';
+  const flaggedHex = decodeXrplClassicAddressToHex(flaggedIssuer);
+  assert.ok(flaggedHex && flaggedHex.length === 40);
+
+  const env = await setupCluster(
+    [
+      {
+        id: 'n-xrplcluster',
+        roles: ['submit'],
+        rateLimit: { ratePerSec: 100, burst: 100 },
+        blacklistedAddresses: [flaggedIssuer],
+      },
+      {
+        id: 'n-xrplws',
+        roles: ['submit'],
+        rateLimit: { ratePerSec: 90, burst: 90 },
+        blacklistedAddresses: [flaggedIssuer],
+      },
+      {
+        id: 'n-xrpllink',
+        roles: ['submit'],
+        rateLimit: { ratePerSec: 80, burst: 80 },
+        blacklistedAddresses: [flaggedIssuer],
+      },
+      {
+        id: 'n-s1',
+        roles: ['submit'],
+        rateLimit: { ratePerSec: 20, burst: 20 },
+      },
+      {
+        id: 'n-s2',
+        roles: ['submit'],
+        rateLimit: { ratePerSec: 20, burst: 20 },
+      },
+      {
+        id: 'n-honey',
+        roles: ['submit'],
+        rateLimit: { ratePerSec: 20, burst: 20 },
+      },
+    ],
+    {
+      limits: {
+        ledgerRetryMaxAttempts: 2,
+        blacklistCacheTtlMs: 0, // Permanent
+        blacklistCacheMaxEntries: 1000,
+      },
+    },
+  );
+
+  try {
+    const client = await connectClient(env.proxyUrl);
+
+    // Simulated OfferCreate tx_blob containing a 48-byte IOU Amount (TakerPays/TakerGets with 20-byte Issuer AccountID)
+    const offerBlob = `12000722000000002400000005D520000000000000000000000000000000000000000000544F4B454E000000${flaggedHex}6540000000000F4240732102AABBCC`;
+
+    // 1. First OfferCreate fails on n-xrplcluster -> n-xrplws -> n-xrpllink (3 rejections > ledgerRetryMaxAttempts=2) and succeeds on n-s1/n-s2/n-honey
+    const r1 = await sendAndWait(client, {
+      id: 'offer-bl-1',
+      command: 'submit',
+      tx_blob: offerBlob,
+    });
+    assert.equal(r1.status, 'success');
+    assert.ok(['n-s1', 'n-s2', 'n-honey'].includes(r1._mockNode));
+
+    for (const blId of ['n-xrplcluster', 'n-xrplws', 'n-xrpllink']) {
+      const runtime = env.proxy.nodeManager.getNode(blId);
+      assert.equal(runtime.blacklistedTargets.size, 1);
+      assert.equal(runtime.blacklistedTargets.get(flaggedIssuer)?.expiresAt, null);
+    }
+
+    // 2. Permanent cache must NOT expire after delay
+    await new Promise((r) => setTimeout(r, 150));
+    const stats = env.proxy.getStats();
+    for (const blId of ['n-xrplcluster', 'n-xrplws', 'n-xrpllink']) {
+      const st = stats.nodes.find((n) => n.id === blId);
+      assert.equal(st.blacklistedCount, 1);
+      assert.equal(st.circuitState, 'CLOSED');
+    }
+
+    const beforeHits = {
+      cluster: env.mocks['n-xrplcluster'].receivedCommands.length,
+      ws: env.mocks['n-xrplws'].receivedCommands.length,
+      link: env.mocks['n-xrpllink'].receivedCommands.length,
+    };
+
+    // 3. Subsequent OfferCreate routes straight to n-s1 / n-s2 / n-honey with 0 hits on any blacklisting node
+    const r2 = await sendAndWait(client, {
+      id: 'offer-bl-2',
+      command: 'submit',
+      tx_blob: offerBlob,
+    });
+    assert.equal(r2.status, 'success');
+    assert.ok(['n-s1', 'n-s2', 'n-honey'].includes(r2._mockNode));
+    assert.equal(env.mocks['n-xrplcluster'].receivedCommands.length, beforeHits.cluster);
+    assert.equal(env.mocks['n-xrplws'].receivedCommands.length, beforeHits.ws);
+    assert.equal(env.mocks['n-xrpllink'].receivedCommands.length, beforeHits.link);
+
+    client.close();
+  } finally {
+    await env.teardown();
+  }
+});
+
+
 

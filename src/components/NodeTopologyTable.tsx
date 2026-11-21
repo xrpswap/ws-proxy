@@ -191,6 +191,16 @@ export function NodeTopologyTable({
                           Clio no-current ({node.currentRejectedCooldownSec}s)
                         </div>
                       )}
+                      {((node.blacklistedCount ?? 0) > 0 || (node.blacklistRejections ?? 0) > 0) && (
+                        <div className="text-[11px] font-mono text-slate-600 mt-0.5 whitespace-nowrap tabular-nums">
+                          Blacklist: {node.blacklistedCount ?? 0} cached · {node.blacklistRejections ?? 0} retried / {node.blacklistBypassed ?? 0} skipped
+                        </div>
+                      )}
+                      {(node.retriedOut ?? 0) > (node.blacklistRejections ?? 0) && (
+                        <div className="text-[11px] font-mono text-slate-500 mt-0.5 whitespace-nowrap tabular-nums">
+                          Failover retries: {(node.retriedOut ?? 0) - (node.blacklistRejections ?? 0)}
+                        </div>
+                      )}
                     </td>
 
                     <td className="py-3 px-4 align-middle text-right font-mono tabular-nums text-xs whitespace-nowrap">

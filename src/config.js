@@ -70,6 +70,8 @@ export const config = {
     clioCooldownMs: 120000,
     ledgerRetryMaxAttempts: 2,
     maxSafeLedgerLag: 15,
+    blacklistCacheTtlMs: 0,
+    blacklistCacheMaxEntries: 1000,
   },
   routing: {
     pathCommands: ['path_find', 'ripple_path_find'],
@@ -109,7 +111,7 @@ export const config = {
       poolSize: 1,
       maxPathConns: 2,
       maxSubscribeConns: 0,
-      rateLimit: { ratePerSec: 5, burst: 16 },
+      rateLimit: { ratePerSec: 5, burst: 18 },
     },
     {
       id: 'xrpl.ws',
@@ -118,12 +120,12 @@ export const config = {
       poolSize: 1,
       maxPathConns: 2,
       maxSubscribeConns: 2,
-      rateLimit: { ratePerSec: 5, burst: 16 },
+      rateLimit: { ratePerSec: 5, burst: 18 },
     },
     {
       id: 'xrpl.link',
       wsUrl: 'wss://xrpl.link/',
-      roles: ['normal', 'history'],
+      roles: ['normal', 'history', 'submit'],
       poolSize: 1,
       maxPathConns: 0,
       maxSubscribeConns: 2,

@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
+import { decodeXrplClassicAddressToHex, payloadMatchesBlacklistedTargets } from './xrplCodec.js';
 
 export class MockXrpldNode {
   constructor({
@@ -9,6 +10,8 @@ export class MockXrpldNode {
     clioMode = false,
     strictLedgerCheck = false,
     rejectSubscribe = false,
+    blacklistedAddresses = [],
+    submitResponder = null,
   } = {}) {
     this.id = id;
     this.roles = roles;
@@ -16,6 +19,14 @@ export class MockXrpldNode {
     this.clioMode = clioMode;
     this.strictLedgerCheck = strictLedgerCheck;
     this.rejectSubscribe = rejectSubscribe;
+    this.submitResponder = submitResponder;
+    this.blacklistedTargets = new Map();
+    for (const addr of blacklistedAddresses) {
+      const accountIdHex = decodeXrplClassicAddressToHex(addr);
+      if (accountIdHex) {
+        this.blacklistedTargets.set(addr, { classic: addr, accountIdHex });
+      }
+    }
     this.server = null;
     this.wss = null;
     this.port = 0;
@@ -247,7 +258,32 @@ export class MockXrpldNode {
         break;
       case 'submit':
       case 'submit_multisigned':
-      case 'sign_and_submit':
+      case 'sign_and_submit': {
+        if (typeof this.submitResponder === 'function') {
+          const custom = this.submitResponder(req, this.id);
+          if (custom) {
+            if (req.id !== undefined && req.id !== null) custom.id = req.id;
+            if (ws.readyState === 1) ws.send(JSON.stringify(custom));
+            return;
+          }
+        }
+        if (this.blacklistedTargets.size > 0) {
+          for (const entry of this.blacklistedTargets.values()) {
+            const singleMap = new Map([[entry.classic, entry]]);
+            if (payloadMatchesBlacklistedTargets(req, singleMap)) {
+              const blErr = {
+                status: 'error',
+                type: 'response',
+                error: 'invalidTransaction',
+                error_message: `Transaction involves a blacklisted address, object, or token (${entry.classic} on Xaman Blacklist.rippleflagged).`,
+                _mockNode: this.id,
+              };
+              if (req.id !== undefined && req.id !== null) blErr.id = req.id;
+              if (ws.readyState === 1) ws.send(JSON.stringify(blErr));
+              return;
+            }
+          }
+        }
         response.result = {
           engine_result: 'tesSUCCESS',
           engine_result_code: 0,
@@ -258,6 +294,7 @@ export class MockXrpldNode {
           },
         };
         break;
+      }
       case 'ripple_path_find':
       case 'book_offers':
         response.result = {
