@@ -11,6 +11,7 @@ export class MockXrpldNode {
     strictLedgerCheck = false,
     rejectSubscribe = false,
     blacklistedAddresses = [],
+    blacklistResponseStyle = 'telBLACKLISTED',
     submitResponder = null,
   } = {}) {
     this.id = id;
@@ -19,6 +20,7 @@ export class MockXrpldNode {
     this.clioMode = clioMode;
     this.strictLedgerCheck = strictLedgerCheck;
     this.rejectSubscribe = rejectSubscribe;
+    this.blacklistResponseStyle = blacklistResponseStyle;
     this.submitResponder = submitResponder;
     this.blacklistedTargets = new Map();
     for (const addr of blacklistedAddresses) {
@@ -271,15 +273,35 @@ export class MockXrpldNode {
           for (const entry of this.blacklistedTargets.values()) {
             const singleMap = new Map([[entry.classic, entry]]);
             if (payloadMatchesBlacklistedTargets(req, singleMap)) {
-              const blErr = {
-                status: 'error',
-                type: 'response',
-                error: 'invalidTransaction',
-                error_message: `Transaction involves a blacklisted address, object, or token (${entry.classic} on Xaman Blacklist.rippleflagged).`,
-                _mockNode: this.id,
-              };
-              if (req.id !== undefined && req.id !== null) blErr.id = req.id;
-              if (ws.readyState === 1) ws.send(JSON.stringify(blErr));
+              const blMsg = `Transaction involves a blacklisted address, object, or token (${entry.classic} on Xaman Blacklist.rippleflagged).`;
+              const blResp =
+                this.blacklistResponseStyle === 'rpc_error'
+                  ? {
+                      status: 'error',
+                      type: 'response',
+                      error: 'invalidTransaction',
+                      error_message: blMsg,
+                      _mockNode: this.id,
+                    }
+                  : {
+                      status: 'success',
+                      type: 'response',
+                      result: {
+                        accepted: false,
+                        applied: false,
+                        broadcast: false,
+                        kept: false,
+                        queued: false,
+                        engine_result: 'telBLACKLISTED',
+                        engine_result_code: -399,
+                        engine_result_message: blMsg,
+                        tx_blob: req.tx_blob,
+                        tx_json: req.tx_json || {},
+                      },
+                      _mockNode: this.id,
+                    };
+              if (req.id !== undefined && req.id !== null) blResp.id = req.id;
+              if (ws.readyState === 1) ws.send(JSON.stringify(blResp));
               return;
             }
           }

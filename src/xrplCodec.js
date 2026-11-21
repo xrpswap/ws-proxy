@@ -6,8 +6,9 @@ for (let i = 0; i < XRPL_ALPHABET.length; i += 1) {
   ALPHABET_MAP.set(XRPL_ALPHABET[i], i);
 }
 
-const CLASSIC_ADDRESS_REGEX = /\br[1-9A-HJ-NP-Za-km-z]{24,34}\b/g;
-const BLACKLIST_MESSAGE_REGEX = /blacklisted|xaman\s+blacklist|rippleflagged/i;
+const CLASSIC_ADDRESS_REGEX =
+  /(?<![1-9A-HJ-NP-Za-km-z])r[1-9A-HJ-NP-Za-km-z]{24,34}(?![1-9A-HJ-NP-Za-km-z])/g;
+const BLACKLIST_MESSAGE_REGEX = /blacklist|blocklist|rippleflagged/i;
 
 function doubleSha256(buf) {
   const first = crypto.createHash('sha256').update(buf).digest();
@@ -93,11 +94,52 @@ export function encodeXrplAccountIdHexToClassic(accountIdHex) {
 }
 
 export function extractBlacklistRejection(msg) {
-  if (!msg || typeof msg !== 'object' || msg.status !== 'error') {
+  if (!msg || typeof msg !== 'object') {
     return { isBlacklistError: false, addresses: [] };
   }
 
-  const combinedText = [msg.error_message, msg.error]
+  let errorTextFields = [];
+  let isSafeLocalRejection = false;
+
+  if (msg.status === 'error') {
+    isSafeLocalRejection = true;
+    errorTextFields = [
+      msg.error_message,
+      msg.error,
+      msg.message,
+      msg.error_exception,
+      msg.result?.error_message,
+      msg.result?.engine_result_message,
+    ];
+  } else if (msg.status === 'success' && msg.result && typeof msg.result === 'object') {
+    const res = msg.result;
+    const engineResult = typeof res.engine_result === 'string' ? res.engine_result : '';
+    // Strictly forbid retry if accepted/applied/broadcast/kept/queued or tes*/tec*/ter*
+    const touchedLedgerOrQueue =
+      res.accepted === true ||
+      res.applied === true ||
+      res.broadcast === true ||
+      res.kept === true ||
+      res.queued === true ||
+      /^(tes|tec|ter)/i.test(engineResult);
+
+    if (!touchedLedgerOrQueue && (engineResult === 'telBLACKLISTED' || /^(tel|tem|tef)/i.test(engineResult))) {
+      isSafeLocalRejection = true;
+      errorTextFields = [
+        res.engine_result,
+        res.engine_result_message,
+        res.error_message,
+        res.error,
+        msg.error_message,
+      ];
+    }
+  }
+
+  if (!isSafeLocalRejection) {
+    return { isBlacklistError: false, addresses: [] };
+  }
+
+  const combinedText = errorTextFields
     .filter((v) => typeof v === 'string' && v.length > 0)
     .join(' ');
 

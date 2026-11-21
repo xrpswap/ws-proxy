@@ -1040,7 +1040,7 @@ export class NodeManager {
         pendingRetrySource = null;
       }
 
-      if (routeInfo.isSubmit && response?.status === 'error') {
+      if (routeInfo.isSubmit && response) {
         const { isBlacklistError, addresses } = extractBlacklistRejection(response);
         if (isBlacklistError) {
           node.recordBlacklistedAddresses(addresses);
@@ -1055,6 +1055,9 @@ export class NodeManager {
             this.totalRetries += 1;
             this.blacklistRetries += 1;
             pendingRetrySource = { node, reason: 'blacklist' };
+            console.warn(
+              `[proxy] Blacklist rejection from "${node.id}" (cached ${addresses.map((a) => a.classic).join(', ') || 'none'}), retrying on peer`,
+            );
             continue;
           }
           return response;

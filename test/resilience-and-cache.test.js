@@ -50,6 +50,7 @@ async function setupCluster(nodeSpecs, overrides = {}) {
       strictLedgerCheck: spec.strictLedgerCheck,
       rejectSubscribe: spec.rejectSubscribe,
       blacklistedAddresses: spec.blacklistedAddresses,
+      blacklistResponseStyle: spec.blacklistResponseStyle,
       submitResponder: spec.submitResponder,
     });
     const wsUrl = await mock.start(0);
@@ -980,7 +981,7 @@ test('23. Xaman Blacklist submit rejection retries on healthy peer, caches flagg
     assert.equal(rClean.status, 'success');
     assert.equal(rClean._mockNode, 'n-xrplcluster-bl');
 
-    // 4. status === 'success' (even tec* mentioning blacklist words) MUST NEVER retry
+    // 4. status === 'success' with tecPATH_DRY (even mentioning blacklist words) MUST NEVER retry
     forceSuccessWithBlacklistedText = true;
     const s1HitsBefore = env.mocks['n-s1'].receivedCommands.filter(
       (c) => c.command === 'submit',
@@ -997,6 +998,25 @@ test('23. Xaman Blacklist submit rejection retries on healthy peer, caches flagg
       (c) => c.command === 'submit',
     ).length;
     assert.equal(s1HitsAfter, s1HitsBefore);
+
+    // 5. Legacy status === 'error' rpc_error format is also supported
+    forceSuccessWithBlacklistedText = false;
+    const rpcErrAddr = encodeXrplAccountIdHexToClassic('44'.repeat(20));
+    const rpcErrHex = decodeXrplClassicAddressToHex(rpcErrAddr);
+    env.mocks['n-xrplcluster-bl'].blacklistResponseStyle = 'rpc_error';
+    env.mocks['n-xrplcluster-bl'].blacklistedTargets.set(rpcErrAddr, {
+      classic: rpcErrAddr,
+      accountIdHex: rpcErrHex,
+    });
+    const rpcErrBlob = `1200072200000000240000000564D5038D7EA4C68000${'00'.repeat(20)}${rpcErrHex}6540000000000F4240`;
+    const rRpcErr = await sendAndWait(client, {
+      id: 'sub-rpc-err-1',
+      command: 'submit',
+      tx_blob: rpcErrBlob,
+    });
+    assert.equal(rRpcErr.status, 'success');
+    assert.equal(rRpcErr._mockNode, 'n-s1');
+    assert.equal(env.proxy.getStats().totalRetries, 2);
 
     client.close();
   } finally {
