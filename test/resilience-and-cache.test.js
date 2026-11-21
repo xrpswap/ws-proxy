@@ -7,6 +7,7 @@ import { ProxyServer } from '../src/proxyServer.js';
 import {
   decodeXrplClassicAddressToHex,
   encodeXrplAccountIdHexToClassic,
+  extractAccountFromTxBlob,
 } from '../src/xrplCodec.js';
 
 function connectClient(url) {
@@ -1258,6 +1259,235 @@ test('26. Upstream tooBusy/slowDown error retries transparently on healthy peer 
     await env.teardown();
   }
 });
+
+test('27. Account sticky routing binds account_info and submit to last successful non-BL submit node until TTL expires', async () => {
+  const senderAddr = 'rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe';
+  const senderHex = decodeXrplClassicAddressToHex(senderAddr);
+  const otherAddr = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
+  const otherHex = decodeXrplClassicAddressToHex(otherAddr);
+  const destAddr = 'rN1bCPAxHDvyJzvkUso1L2wvXufgE4gXPL';
+  const destHex = decodeXrplClassicAddressToHex(destAddr);
+  assert.ok(senderHex && otherHex && destHex);
+
+  // Realistic canonical XRPL Payment tx_blob:
+  // TransactionType(1,2)=0000, Flags(2,2)=80000000, Sequence(2,4)=00000001,
+  // Amount(6,1)=40000000000F4240, Fee(6,8)=400000000000000C,
+  // SigningPubKey(7,3)=21+<33 bytes>, Account(8,1)=14+<20 bytes>, Destination(8,3)=14+<20 bytes>
+  const makeSignedBlob = (acctHex, destinationHex) =>
+    `1200002280000000240000000161400000000000000C68400000000000000C7321${'02'.repeat(33)}8114${acctHex}8314${destinationHex}`;
+
+  const senderBlob = makeSignedBlob(senderHex, destHex);
+  const otherPastSeqBlob = makeSignedBlob(otherHex, otherHex);
+  assert.equal(extractAccountFromTxBlob(senderBlob), senderAddr);
+  assert.equal(extractAccountFromTxBlob(otherPastSeqBlob), otherAddr);
+
+  let failPastSeqOnOther = false;
+  const env = await setupCluster(
+    [
+      {
+        id: 'n-bl',
+        roles: ['normal', 'submit'],
+        rateLimit: { ratePerSec: 10, burst: 100 },
+        blacklistedAddresses: [destAddr],
+      },
+      {
+        id: 'n-sticky-ok',
+        roles: ['normal', 'submit'],
+        rateLimit: { ratePerSec: 5, burst: 30 },
+      },
+      {
+        id: 'n-other',
+        roles: ['normal', 'submit'],
+        rateLimit: { ratePerSec: 5, burst: 29 },
+        submitResponder: (_req, nodeId) => {
+          if (failPastSeqOnOther) {
+            return {
+              status: 'success',
+              type: 'response',
+              result: {
+                accepted: false,
+                applied: false,
+                broadcast: false,
+                kept: false,
+                queued: false,
+                engine_result: 'tefPAST_SEQ',
+                engine_result_code: -190,
+                engine_result_message: 'This sequence number has already passed.',
+                tx_json: { Account: otherAddr, TransactionType: 'Payment' },
+              },
+              _mockNode: nodeId,
+            };
+          }
+          return null;
+        },
+      },
+    ],
+    {
+      limits: {
+        accountStickyTtlMs: 250,
+        accountStickyWaitMs: 150,
+        blacklistCacheTtlMs: 60000,
+      },
+    },
+  );
+
+  try {
+    const client = await connectClient(env.proxyUrl);
+
+    // 1. First submit for senderAddr hits n-bl (BL rejection) -> retries onto n-sticky-ok (30 > 29) and succeeds
+    const r1 = await sendAndWait(client, {
+      id: 'sticky-sub-1',
+      command: 'submit',
+      tx_blob: senderBlob,
+    });
+    assert.equal(r1.status, 'success');
+    assert.equal(r1._mockNode, 'n-sticky-ok');
+    assert.equal(env.proxy.getStats().accountStickyCount, 1);
+
+    // Even though n-other now has more tokens (29 > 28) and n-bl has 98 tokens,
+    // subsequent account_info and submit for senderAddr MUST route to n-sticky-ok!
+    const ai1 = await sendAndWait(client, {
+      id: 'sticky-ai-1',
+      command: 'account_info',
+      account: senderAddr,
+      ledger_index: 'current',
+    });
+    assert.equal(ai1.status, 'success');
+    assert.equal(ai1._mockNode, 'n-sticky-ok');
+
+    const r2 = await sendAndWait(client, {
+      id: 'sticky-sub-2',
+      command: 'submit',
+      tx_blob: senderBlob,
+    });
+    assert.equal(r2.status, 'success');
+    assert.equal(r2._mockNode, 'n-sticky-ok');
+
+    // 2. Different account is NOT bound to n-sticky-ok
+    const aiOther = await sendAndWait(client, {
+      id: 'other-ai-1',
+      command: 'account_info',
+      account: otherAddr,
+    });
+    assert.equal(aiOther.status, 'success');
+    assert.equal(aiOther._mockNode, 'n-bl');
+
+    // 3. Failed submit (tefPAST_SEQ) must NOT record sticky for otherAddr
+    // Drain n-bl isn't needed; make tefPAST_SEQ return from n-other via direct test or disable n-bl/n-sticky-ok temporarily
+    env.proxy.nodeManager.getNode('n-bl').tripCircuit();
+    env.proxy.nodeManager.getNode('n-sticky-ok').tripCircuit();
+    failPastSeqOnOther = true;
+    const rPast = await sendAndWait(client, {
+      id: 'other-past-seq',
+      command: 'submit',
+      tx_blob: otherPastSeqBlob,
+    });
+    assert.equal(rPast.result.engine_result, 'tefPAST_SEQ');
+    assert.equal(env.proxy.nodeManager.getStickyNodeId(otherAddr), null);
+    assert.equal(env.proxy.getStats().accountStickyCount, 1);
+
+    // Restore nodes and wait for sticky TTL to expire
+    env.proxy.nodeManager.getNode('n-bl').setCircuitState('CLOSED');
+    env.proxy.nodeManager.getNode('n-sticky-ok').setCircuitState('CLOSED');
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(env.proxy.getStats().accountStickyCount, 0);
+
+    // After TTL expires, senderAddr account_info returns to normal highest-token routing (n-bl)
+    const aiAfterExpiry = await sendAndWait(client, {
+      id: 'sticky-ai-expired',
+      command: 'account_info',
+      account: senderAddr,
+    });
+    assert.equal(aiAfterExpiry.status, 'success');
+    assert.equal(aiAfterExpiry._mockNode, 'n-bl');
+
+    client.close();
+  } finally {
+    await env.teardown();
+  }
+});
+
+test('28. Batch of 10 sequential orders exceeding burst stays on sticky node via short-wait hold, and falls back if sticky node trips OPEN', async () => {
+  const senderAddr = 'rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe';
+  const senderHex = decodeXrplClassicAddressToHex(senderAddr);
+  const destHex = decodeXrplClassicAddressToHex('rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh');
+  const signedBlob = `1200002280000000240000000168400000000000000C7321${'02'.repeat(33)}8114${senderHex}8314${destHex}`;
+
+  const env = await setupCluster(
+    [
+      {
+        id: 'n-sticky',
+        roles: ['normal', 'submit'],
+        // burst=20 holds 5 orders (account_info=2 + submit=2 => 4/order).
+        // Orders 6..10 need token refill (2 tokens at 25/s = 80ms < accountStickyWaitMs=400ms).
+        rateLimit: { ratePerSec: 25, burst: 20 },
+      },
+      {
+        id: 'n-peer',
+        roles: ['normal', 'submit'],
+        rateLimit: { ratePerSec: 100, burst: 15 },
+      },
+    ],
+    {
+      limits: {
+        accountStickyTtlMs: 15000,
+        accountStickyWaitMs: 400,
+        queueMaxWaitMs: 1800,
+      },
+    },
+  );
+
+  try {
+    const client = await connectClient(env.proxyUrl);
+
+    // Order 1 submit initializes sticky to n-sticky (20 > 15)
+    const firstSubmit = await sendAndWait(client, {
+      id: 'batch-init',
+      command: 'submit',
+      tx_blob: signedBlob,
+    });
+    assert.equal(firstSubmit._mockNode, 'n-sticky');
+
+    // Run 10 sequential (account_info -> submit) orders = 40 tokens > burst=20!
+    // Every single request must stay on n-sticky without jumping to n-peer on order #6.
+    for (let i = 1; i <= 10; i += 1) {
+      const ai = await sendAndWait(client, {
+        id: `batch-ai-${i}`,
+        command: 'account_info',
+        account: senderAddr,
+        ledger_index: 'current',
+      });
+      assert.equal(ai.status, 'success');
+      assert.equal(ai._mockNode, 'n-sticky', `Order #${i} account_info jumped off sticky node`);
+
+      const sub = await sendAndWait(client, {
+        id: `batch-sub-${i}`,
+        command: 'submit',
+        tx_blob: signedBlob,
+      });
+      assert.equal(sub.status, 'success');
+      assert.equal(sub._mockNode, 'n-sticky', `Order #${i} submit jumped off sticky node`);
+    }
+
+    assert.equal(env.mocks['n-peer'].receivedCommands.length, 0);
+
+    // If sticky node trips OPEN, next request immediately falls back to n-peer without waiting
+    env.proxy.nodeManager.getNode('n-sticky').tripCircuit();
+    const fallbackAi = await sendAndWait(client, {
+      id: 'batch-fallback-ai',
+      command: 'account_info',
+      account: senderAddr,
+      ledger_index: 'current',
+    });
+    assert.equal(fallbackAi.status, 'success');
+    assert.equal(fallbackAi._mockNode, 'n-peer');
+
+    client.close();
+  } finally {
+    await env.teardown();
+  }
+});
+
 
 
 

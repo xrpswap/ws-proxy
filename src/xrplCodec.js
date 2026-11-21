@@ -197,3 +197,131 @@ export function payloadMatchesBlacklistedTargets(payload, targetEntries) {
 
   return false;
 }
+
+function readVlLength(buf, offset) {
+  if (offset >= buf.length) return null;
+  const b1 = buf[offset];
+  if (b1 <= 192) {
+    return { length: b1, bytesRead: 1 };
+  }
+  if (b1 <= 240) {
+    if (offset + 1 >= buf.length) return null;
+    const b2 = buf[offset + 1];
+    return { length: 193 + (b1 - 193) * 256 + b2, bytesRead: 2 };
+  }
+  if (b1 <= 254) {
+    if (offset + 2 >= buf.length) return null;
+    const b2 = buf[offset + 1];
+    const b3 = buf[offset + 2];
+    return { length: 12481 + (b1 - 241) * 65536 + (b2 << 8) + b3, bytesRead: 3 };
+  }
+  return null;
+}
+
+export function extractAccountFromTxBlob(txBlob) {
+  if (typeof txBlob !== 'string' || txBlob.length < 44 || txBlob.length % 2 !== 0) {
+    return null;
+  }
+  if (!/^[0-9a-fA-F]+$/.test(txBlob)) {
+    return null;
+  }
+
+  const buf = Buffer.from(txBlob, 'hex');
+  let offset = 0;
+
+  while (offset < buf.length) {
+    const header = buf[offset++];
+    let typeCode = header >> 4;
+    let fieldCode = header & 0x0f;
+
+    if (typeCode === 0) {
+      if (offset >= buf.length) return null;
+      typeCode = buf[offset++];
+    }
+    if (fieldCode === 0) {
+      if (offset >= buf.length) return null;
+      fieldCode = buf[offset++];
+    }
+
+    if (typeCode === 1) {
+      offset += 2; // UInt16
+    } else if (typeCode === 2) {
+      offset += 4; // UInt32
+    } else if (typeCode === 3) {
+      offset += 8; // UInt64
+    } else if (typeCode === 4) {
+      offset += 16; // Hash128
+    } else if (typeCode === 5) {
+      offset += 32; // Hash256
+    } else if (typeCode === 6) {
+      if (offset >= buf.length) return null;
+      const isIou = (buf[offset] & 0x80) !== 0;
+      offset += isIou ? 48 : 8; // Amount
+    } else if (typeCode === 7) {
+      const vl = readVlLength(buf, offset);
+      if (!vl) return null;
+      offset += vl.bytesRead + vl.length; // Blob
+    } else if (typeCode === 8) {
+      const vl = readVlLength(buf, offset);
+      if (!vl) return null;
+      offset += vl.bytesRead;
+      if (offset + vl.length > buf.length) return null;
+      if (fieldCode === 1 && vl.length === 20) {
+        return encodeXrplAccountIdHexToClassic(
+          buf.subarray(offset, offset + 20).toString('hex'),
+        );
+      }
+      offset += vl.length;
+    } else {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+export function extractAccountFromRequest(payload, isSubmit = false) {
+  if (!payload || typeof payload !== 'object') return null;
+
+  if (payload.command === 'account_info') {
+    if (typeof payload.account === 'string' && decodeXrplClassicAddressToHex(payload.account)) {
+      return payload.account;
+    }
+    return null;
+  }
+
+  if (isSubmit) {
+    const jsonAccount = payload.tx_json?.Account;
+    if (typeof jsonAccount === 'string' && decodeXrplClassicAddressToHex(jsonAccount)) {
+      return jsonAccount;
+    }
+    if (typeof payload.account === 'string' && decodeXrplClassicAddressToHex(payload.account)) {
+      return payload.account;
+    }
+    if (typeof payload.tx_blob === 'string') {
+      return extractAccountFromTxBlob(payload.tx_blob);
+    }
+  }
+
+  return null;
+}
+
+export function isSuccessfulSubmitResponse(msg) {
+  if (!msg || typeof msg !== 'object' || msg.status !== 'success') {
+    return false;
+  }
+  const res = msg.result;
+  if (!res || typeof res !== 'object') {
+    return false;
+  }
+  const engineResult = typeof res.engine_result === 'string' ? res.engine_result : '';
+  return (
+    res.accepted === true ||
+    res.applied === true ||
+    res.broadcast === true ||
+    res.kept === true ||
+    res.queued === true ||
+    /^(tes|ter)/i.test(engineResult)
+  );
+}
+

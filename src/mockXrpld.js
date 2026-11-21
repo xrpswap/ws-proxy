@@ -1,6 +1,10 @@
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
-import { decodeXrplClassicAddressToHex, payloadMatchesBlacklistedTargets } from './xrplCodec.js';
+import {
+  decodeXrplClassicAddressToHex,
+  extractAccountFromRequest,
+  payloadMatchesBlacklistedTargets,
+} from './xrplCodec.js';
 
 export class MockXrpldNode {
   constructor({
@@ -339,11 +343,14 @@ export class MockXrpldNode {
             }
           }
         }
+        const txAccount = extractAccountFromRequest(req, true);
         response.result = {
+          accepted: true,
           engine_result: 'tesSUCCESS',
           engine_result_code: 0,
           engine_result_message: 'The transaction was applied.',
           tx_json: {
+            ...(txAccount ? { Account: txAccount } : {}),
             TransactionType: 'Payment',
             hash: 'E08D6E9754025BA2534A78707605E0601F03ACE063687A0CA1BDDACFCD1698C7',
           },

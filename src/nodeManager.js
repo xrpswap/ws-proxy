@@ -1,7 +1,12 @@
 import WebSocket from 'ws';
 import { applyResponseId, extractRequestId } from './errors.js';
 import { BoundedRateQueue, TokenBucket } from './rateLimiter.js';
-import { extractBlacklistRejection, payloadMatchesBlacklistedTargets } from './xrplCodec.js';
+import {
+  extractAccountFromRequest,
+  extractBlacklistRejection,
+  isSuccessfulSubmitResponse,
+  payloadMatchesBlacklistedTargets,
+} from './xrplCodec.js';
 
 function createProxyError(code, message) {
   const err = new Error(message);
@@ -748,6 +753,60 @@ export class NodeManager {
     this.blacklistRetries = 0;
     this.blacklistBypassed = 0;
     this.lastRetry = null;
+    this.accountStickyNodes = new Map();
+  }
+
+  pruneAccountSticky(now = Date.now()) {
+    for (const [account, entry] of this.accountStickyNodes.entries()) {
+      if (entry.expiresAt <= now) {
+        this.accountStickyNodes.delete(account);
+      }
+    }
+  }
+
+  getStickyNodeId(account, now = Date.now()) {
+    if (!account) return null;
+    const ttlMs = this.limits.accountStickyTtlMs ?? 0;
+    if (ttlMs <= 0) return null;
+    const entry = this.accountStickyNodes.get(account);
+    if (!entry) return null;
+    if (entry.expiresAt <= now) {
+      this.accountStickyNodes.delete(account);
+      return null;
+    }
+    return entry.nodeId;
+  }
+
+  clearStickyIfNode(account, nodeId) {
+    if (!account || !nodeId) return;
+    const entry = this.accountStickyNodes.get(account);
+    if (entry && entry.nodeId === nodeId) {
+      this.accountStickyNodes.delete(account);
+    }
+  }
+
+  recordAccountSticky(account, nodeId, now = Date.now()) {
+    if (!account || !nodeId) return;
+    const ttlMs = this.limits.accountStickyTtlMs ?? 0;
+    if (ttlMs <= 0) return;
+
+    if (this.accountStickyNodes.has(account)) {
+      this.accountStickyNodes.delete(account);
+    }
+    this.accountStickyNodes.set(account, {
+      nodeId,
+      expiresAt: now + ttlMs,
+    });
+
+    const maxEntries = this.limits.accountStickyMaxEntries ?? 2000;
+    if (maxEntries > 0 && this.accountStickyNodes.size > maxEntries) {
+      this.pruneAccountSticky(now);
+      while (this.accountStickyNodes.size > maxEntries) {
+        const oldestKey = this.accountStickyNodes.keys().next().value;
+        if (!oldestKey) break;
+        this.accountStickyNodes.delete(oldestKey);
+      }
+    }
   }
 
   isLedgerStreamEnabled() {
@@ -813,6 +872,8 @@ export class NodeManager {
       requiresCurrent = false,
       preferSafeLag = false,
       submitPayload = null,
+      stickyNodeId = null,
+      stickyDeadline = 0,
     } = options;
 
     const { roleNodes, healthyConnected } = this.getEligibleStatelessNodes(
@@ -866,6 +927,29 @@ export class NodeManager {
         if (unsampledOrSynced.length > 0) {
           candidates = unsampledOrSynced;
         }
+      }
+    }
+
+    const stickyCandidate = stickyNodeId
+      ? candidates.find((n) => n.id === stickyNodeId) || null
+      : null;
+    if (stickyCandidate) {
+      if (stickyCandidate.bucket.tryConsume(weight, now)) {
+        const conn = stickyCandidate.pickPoolConnection();
+        if (conn) {
+          if (stickyCandidate.circuitState === 'HALF_OPEN') {
+            stickyCandidate.halfOpenInFlight = true;
+          }
+          if (skippedBlacklistNodes.length > 0) {
+            this.blacklistBypassed += 1;
+            for (const skipped of skippedBlacklistNodes) {
+              skipped.blacklistBypassed += 1;
+            }
+          }
+          return { node: stickyCandidate, conn };
+        }
+      } else if (stickyDeadline > now) {
+        return null;
       }
     }
 
@@ -924,16 +1008,34 @@ export class NodeManager {
   }
 
   async acquireStateless(role, weight, options = {}) {
-    const immediate = this.tryAcquireStatelessCandidate(role, weight, options);
+    const stickyAccount = options.stickyAccount || null;
+    const stickyNodeId = stickyAccount ? this.getStickyNodeId(stickyAccount) : null;
+    const maxQueueWait = this.limits.queueMaxWaitMs ?? 1800;
+    const configuredStickyWait = this.limits.accountStickyWaitMs ?? 700;
+    const stickyWaitMs =
+      stickyNodeId && configuredStickyWait > 0
+        ? Math.min(configuredStickyWait, Math.max(0, maxQueueWait - 100))
+        : 0;
+    const stickyDeadline = stickyWaitMs > 0 ? Date.now() + stickyWaitMs : 0;
+
+    const immediate = this.tryAcquireStatelessCandidate(role, weight, {
+      ...options,
+      stickyNodeId,
+      stickyDeadline,
+    });
     if (immediate) {
       return immediate;
     }
     return this.rateQueue.enqueue(() =>
-      this.tryAcquireStatelessCandidate(role, weight, options),
+      this.tryAcquireStatelessCandidate(role, weight, {
+        ...options,
+        stickyNodeId: stickyAccount ? this.getStickyNodeId(stickyAccount) : null,
+        stickyDeadline,
+      }),
     );
   }
 
-  async sendSingleStatelessAttempt(payload, routeInfo, excludedNodeIds) {
+  async sendSingleStatelessAttempt(payload, routeInfo, excludedNodeIds, stickyAccount = null) {
     const { hasOriginalId, originalId } = extractRequestId(payload);
     const { node, conn } = await this.acquireStateless(routeInfo.role, routeInfo.weight, {
       excludedNodeIds,
@@ -941,6 +1043,7 @@ export class NodeManager {
       requiresCurrent: routeInfo.requiresCurrent,
       preferSafeLag: routeInfo.preferSafeLag,
       submitPayload: routeInfo.isSubmit ? payload : null,
+      stickyAccount,
     });
 
     node.recordRequestStart();
@@ -1001,6 +1104,7 @@ export class NodeManager {
     const routeInfo =
       typeof roleOrRouteInfo === 'string'
         ? {
+            command: payload?.command || '',
             role: roleOrRouteInfo,
             isSubmit: roleOrRouteInfo === 'submit',
             weight: weightArg ?? 2,
@@ -1009,6 +1113,11 @@ export class NodeManager {
             preferSafeLag: false,
           }
         : roleOrRouteInfo;
+
+    const stickyAccount =
+      routeInfo.isSubmit || routeInfo.command === 'account_info'
+        ? extractAccountFromRequest(payload, routeInfo.isSubmit)
+        : null;
 
     const ledgerMaxAttempts = 1 + (this.limits.ledgerRetryMaxAttempts ?? 2);
     const roleNodeCount = this.nodes.filter((n) => n.hasRole(routeInfo.role)).length;
@@ -1026,6 +1135,7 @@ export class NodeManager {
           payload,
           routeInfo,
           excludedNodeIds,
+          stickyAccount,
         );
       } catch (err) {
         if (lastResponse && err.code === 'noNodesAvailable') {
@@ -1051,6 +1161,7 @@ export class NodeManager {
       if (routeInfo.isSubmit && response) {
         const { isBlacklistError, addresses } = extractBlacklistRejection(response);
         if (isBlacklistError) {
+          this.clearStickyIfNode(stickyAccount, node.id);
           node.recordBlacklistedAddresses(addresses);
           node.blacklistRejections += 1;
           excludedNodeIds.add(node.id);
@@ -1104,6 +1215,7 @@ export class NodeManager {
       }
 
       if (isUpstreamLoadRejection(response)) {
+        this.clearStickyIfNode(stickyAccount, node.id);
         excludedNodeIds.add(node.id);
         const { healthyConnected } = this.getEligibleStatelessNodes(
           routeInfo.role,
@@ -1116,6 +1228,16 @@ export class NodeManager {
           continue;
         }
         return response;
+      }
+
+      if (routeInfo.isSubmit && isSuccessfulSubmitResponse(response)) {
+        const resolvedAccount =
+          response?.result?.tx_json?.Account ||
+          stickyAccount ||
+          extractAccountFromRequest(payload, true);
+        if (resolvedAccount) {
+          this.recordAccountSticky(resolvedAccount, node.id);
+        }
       }
 
       return response;
@@ -1597,6 +1719,8 @@ export class NodeManager {
       sampledLedgerNodes,
     } = this.computeLedgerWatermarks(now);
 
+    this.pruneAccountSticky(now);
+
     return {
       totalNodes: nodes.length,
       healthyNodes,
@@ -1613,6 +1737,7 @@ export class NodeManager {
       totalRetries: this.totalRetries,
       blacklistRetries: this.blacklistRetries,
       blacklistBypassed: this.blacklistBypassed,
+      accountStickyCount: this.accountStickyNodes.size,
       lastRetry: this.lastRetry,
       nodes,
     };
@@ -1633,6 +1758,7 @@ export class NodeManager {
       }
     }
     this.ledgerSnapshots.clear();
+    this.accountStickyNodes.clear();
     for (const [proxyId, entry] of this.pendingRequests.entries()) {
       clearTimeout(entry.timer);
       this.pendingRequests.delete(proxyId);

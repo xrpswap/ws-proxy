@@ -54,6 +54,7 @@ export interface ProxyStats {
   totalRetries?: number;
   blacklistRetries?: number;
   blacklistBypassed?: number;
+  accountStickyCount?: number;
   lastRetry?: {
     at: number;
     reason: string;
@@ -109,6 +110,9 @@ export interface ProxyStats {
     maxSafeLedgerLag?: number;
     blacklistCacheTtlMs?: number;
     blacklistCacheMaxEntries?: number;
+    accountStickyTtlMs?: number;
+    accountStickyWaitMs?: number;
+    accountStickyMaxEntries?: number;
   };
   server: {
     host: string;

@@ -113,8 +113,8 @@ export function NodeTopologyTable({
 
   return (
     <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-      <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-4">
-        <div>
+      <div className="px-5 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
           <h2 className="text-base font-semibold text-slate-900">
             Upstream Node Pools & Circuit State
           </h2>
@@ -122,16 +122,16 @@ export function NodeTopologyTable({
             Role capabilities, stateful slot allocation, weighted token buckets, and failover state
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-4 shrink-0">
+        <div className="flex flex-wrap items-center gap-3 shrink-0">
           {actionError && (
             <div className="text-xs text-red-700 font-medium">{actionError}</div>
           )}
-          <div className="text-xs font-mono tabular-nums text-slate-600 whitespace-nowrap">
-            Failover retries:{' '}
+          <div className="text-xs font-mono tabular-nums text-slate-600">
+            Retries:{' '}
             <span className={totalRetries > 0 ? 'text-slate-900 font-semibold' : 'text-slate-500'}>
               {totalRetries}
             </span>
-            {' · '}BL skipped:{' '}
+            {' · '}BL skip:{' '}
             <span
               className={blacklistBypassed > 0 ? 'text-slate-900 font-semibold' : 'text-slate-500'}
             >
@@ -168,17 +168,17 @@ export function NodeTopologyTable({
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50/70 text-[12px] font-medium text-slate-500">
-                <th className="py-3 px-4 whitespace-nowrap">Node / Endpoint</th>
-                <th className="py-3 px-4 whitespace-nowrap">Roles</th>
-                <th className="py-3 px-4 whitespace-nowrap">Circuit Status</th>
-                <th className="py-3 px-4 whitespace-nowrap text-right">Ledger Height</th>
-                <th className="py-3 px-4 whitespace-nowrap text-right">Pool WS</th>
-                <th className="py-3 px-4 whitespace-nowrap text-right">Path Slots</th>
-                <th className="py-3 px-4 whitespace-nowrap text-right">Sub Slots</th>
-                <th className="py-3 px-4 whitespace-nowrap text-right">Tokens / Rate</th>
-                <th className="py-3 px-4 whitespace-nowrap text-right">Req / Err / QPS</th>
+                <th className="py-3 px-3 whitespace-nowrap">Node / Endpoint</th>
+                <th className="py-3 px-2.5 whitespace-nowrap">Roles</th>
+                <th className="py-3 px-2.5 whitespace-nowrap">Circuit Status</th>
+                <th className="py-3 px-2.5 whitespace-nowrap text-right">Ledger Height</th>
+                <th className="py-3 px-2.5 whitespace-nowrap text-right">Pool WS</th>
+                <th className="py-3 px-2.5 whitespace-nowrap text-right">Path Slots</th>
+                <th className="py-3 px-2.5 whitespace-nowrap text-right">Sub Slots</th>
+                <th className="py-3 px-2.5 whitespace-nowrap text-right">Tokens / Rate</th>
+                <th className="py-3 px-2.5 whitespace-nowrap text-right">Req / Err / QPS</th>
                 {!readOnly && (
-                  <th className="py-3 px-4 whitespace-nowrap text-right">Fault Injection</th>
+                  <th className="py-3 px-3 whitespace-nowrap text-right">Fault Injection</th>
                 )}
               </tr>
             </thead>
@@ -188,46 +188,62 @@ export function NodeTopologyTable({
                 const isMockOnline = node.mockOnline ?? node.isOnline;
                 return (
                   <tr key={node.id} className="hover:bg-slate-50/80 transition-colors">
-                    <td className="py-3 px-4 align-middle">
+                    <td className="py-3 px-3 align-middle">
                       <div className="font-medium text-slate-900 whitespace-nowrap">
                         {node.id}
                       </div>
-                      <div className="text-xs text-slate-500 font-mono truncate max-w-[210px]">
+                      <div
+                        className="text-xs text-slate-500 font-mono truncate max-w-[165px]"
+                        title={node.wsUrl}
+                      >
                         {node.wsUrl}
                       </div>
                     </td>
 
-                    <td className="py-3 px-4 align-middle">
+                    <td className="py-3 px-2.5 align-middle">
                       <div className="text-xs font-mono text-slate-700 whitespace-nowrap">
                         {node.roles.join(' · ')}
                       </div>
                     </td>
 
-                    <td className="py-3 px-4 align-middle">
+                    <td className="py-3 px-2.5 align-middle">
                       {renderStateLabel(node)}
                       {node.isSlowedDown && (
-                        <div className="text-[11px] font-mono text-amber-700 mt-0.5 whitespace-nowrap">
-                          Backpressure {node.rateMultiplier}x
+                        <div
+                          className="text-[11px] font-mono text-amber-700 mt-0.5 whitespace-nowrap"
+                          title={`Backpressure ${node.rateMultiplier}x`}
+                        >
+                          Slow {node.rateMultiplier}x
                         </div>
                       )}
                       {(node.currentRejectedCooldownSec ?? 0) > 0 && (
-                        <div className="text-[11px] font-mono text-amber-700 mt-0.5 whitespace-nowrap tabular-nums">
-                          Clio no-current ({node.currentRejectedCooldownSec}s)
+                        <div
+                          className="text-[11px] font-mono text-amber-700 mt-0.5 whitespace-nowrap tabular-nums"
+                          title={`Clio rejected ledger_index: current (${node.currentRejectedCooldownSec}s cooldown)`}
+                        >
+                          No-current ({node.currentRejectedCooldownSec}s)
                         </div>
                       )}
                       {((node.blacklistedCount ?? 0) > 0 || (node.blacklistRejections ?? 0) > 0) && (
-                        <div className="text-[11px] font-mono text-slate-600 mt-0.5 whitespace-nowrap tabular-nums">
-                          Blacklist: {node.blacklistedCount ?? 0} cached · {node.blacklistRejections ?? 0} retried / {node.blacklistBypassed ?? 0} skipped
+                        <div
+                          className="text-[11px] font-mono text-slate-600 mt-0.5 whitespace-nowrap tabular-nums"
+                          title={`Blacklist: ${node.blacklistedCount ?? 0} cached · ${node.blacklistRejections ?? 0} retried · ${node.blacklistBypassed ?? 0} skipped`}
+                        >
+                          BL {node.blacklistedCount ?? 0}c · {node.blacklistRejections ?? 0}r /{' '}
+                          {node.blacklistBypassed ?? 0}s
                         </div>
                       )}
                       {(node.retriedOut ?? 0) > (node.blacklistRejections ?? 0) && (
-                        <div className="text-[11px] font-mono text-slate-500 mt-0.5 whitespace-nowrap tabular-nums">
-                          Failover retries: {(node.retriedOut ?? 0) - (node.blacklistRejections ?? 0)}
+                        <div
+                          className="text-[11px] font-mono text-slate-500 mt-0.5 whitespace-nowrap tabular-nums"
+                          title="Non-blacklist failover retries routed away from this node"
+                        >
+                          Retries: {(node.retriedOut ?? 0) - (node.blacklistRejections ?? 0)}
                         </div>
                       )}
                     </td>
 
-                    <td className="py-3 px-4 align-middle text-right font-mono tabular-nums text-xs whitespace-nowrap">
+                    <td className="py-3 px-2.5 align-middle text-right font-mono tabular-nums text-xs whitespace-nowrap">
                       {typeof node.lastValidatedSeq === 'number' ? (
                         <>
                           <div className="text-slate-900 font-medium">
@@ -267,11 +283,11 @@ export function NodeTopologyTable({
                       )}
                     </td>
 
-                    <td className="py-3 px-4 align-middle text-right font-mono tabular-nums text-xs text-slate-700 whitespace-nowrap">
+                    <td className="py-3 px-2.5 align-middle text-right font-mono tabular-nums text-xs text-slate-700 whitespace-nowrap">
                       {node.activePoolConns} / {node.poolSize}
                     </td>
 
-                    <td className="py-3 px-4 align-middle text-right font-mono tabular-nums text-xs text-slate-700 whitespace-nowrap">
+                    <td className="py-3 px-2.5 align-middle text-right font-mono tabular-nums text-xs text-slate-700 whitespace-nowrap">
                       {node.maxPathConns === 0 ? (
                         <span className="text-slate-400">0</span>
                       ) : (
@@ -279,7 +295,7 @@ export function NodeTopologyTable({
                       )}
                     </td>
 
-                    <td className="py-3 px-4 align-middle text-right font-mono tabular-nums text-xs text-slate-700 whitespace-nowrap">
+                    <td className="py-3 px-2.5 align-middle text-right font-mono tabular-nums text-xs text-slate-700 whitespace-nowrap">
                       {node.maxSubscribeConns === 0 ? (
                         <span className="text-slate-400">0</span>
                       ) : (
@@ -287,7 +303,7 @@ export function NodeTopologyTable({
                       )}
                     </td>
 
-                    <td className="py-3 px-4 align-middle text-right font-mono tabular-nums text-xs whitespace-nowrap">
+                    <td className="py-3 px-2.5 align-middle text-right font-mono tabular-nums text-xs whitespace-nowrap">
                       <div className="text-slate-900 font-medium">
                         {node.tokens.toFixed(1)} / {node.burst}
                       </div>
@@ -300,7 +316,7 @@ export function NodeTopologyTable({
                       </div>
                     </td>
 
-                    <td className="py-3 px-4 align-middle text-right font-mono tabular-nums text-xs whitespace-nowrap">
+                    <td className="py-3 px-2.5 align-middle text-right font-mono tabular-nums text-xs whitespace-nowrap">
                       <span className="text-slate-900">{node.totalRequests}</span>
                       <span className="text-slate-300 mx-1">/</span>
                       <span
@@ -315,8 +331,8 @@ export function NodeTopologyTable({
                     </td>
 
                     {!readOnly && (
-                      <td className="py-3 px-4 align-middle text-right whitespace-nowrap">
-                        <div className="inline-flex items-center justify-end gap-1.5">
+                      <td className="py-3 px-3 align-middle text-right whitespace-nowrap">
+                        <div className="inline-flex items-center justify-end gap-1">
                           <button
                             type="button"
                             disabled={isBusy || !node.mockMode}
@@ -330,7 +346,7 @@ export function NodeTopologyTable({
                                   : 'Start mock upstream node'
                                 : 'Only available in mock mode'
                             }
-                            className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                            className={`inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
                               isMockOnline
                                 ? 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
                                 : 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
@@ -348,7 +364,7 @@ export function NodeTopologyTable({
                                 state: node.circuitState === 'OPEN' ? 'CLOSED' : 'OPEN',
                               })
                             }
-                            className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 ${
+                            className={`inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 ${
                               node.circuitState === 'OPEN'
                                 ? 'border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100'
                                 : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
@@ -365,7 +381,7 @@ export function NodeTopologyTable({
                               runNodeAction(node.id, `/api/nodes/${node.id}/load-warning`)
                             }
                             title="Inject warning: load in next response"
-                            className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                            className={`inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
                               node.loadWarningArmed
                                 ? 'border-amber-300 bg-amber-50 text-amber-800'
                                 : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'

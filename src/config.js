@@ -72,6 +72,9 @@ export const config = {
     maxSafeLedgerLag: 15,
     blacklistCacheTtlMs: 0,
     blacklistCacheMaxEntries: 1000,
+    accountStickyTtlMs: 15000,
+    accountStickyWaitMs: 700,
+    accountStickyMaxEntries: 2000,
   },
   routing: {
     pathCommands: ['path_find', 'ripple_path_find'],

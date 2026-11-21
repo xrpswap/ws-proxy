@@ -440,6 +440,7 @@ export class ProxyServer {
       totalRetries: nodeStats.totalRetries,
       blacklistRetries: nodeStats.blacklistRetries,
       blacklistBypassed: nodeStats.blacklistBypassed,
+      accountStickyCount: nodeStats.accountStickyCount,
       lastRetry: nodeStats.lastRetry,
       cache: cacheStats,
       ledgerStream: this.config.ledgerStream,
